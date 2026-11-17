@@ -399,6 +399,12 @@ fn scan_dir(root: &Path, prefix: &str) -> Vec<Found> {
 /// What mods ask of the window.
 pub enum Request {
     Run { name: String, args: Value },
+    QuickTerminalAutoHide,
+    ShortcutRecording { copy: u64, action: String },
+    #[cfg(not(target_os = "macos"))]
+    ShortcutRecorded { shortcut: String },
+    #[cfg(not(target_os = "macos"))]
+    QuickTerminalShortcutError(Option<String>),
     OpenOverlay { id: String, spec: Value },
     CloseOverlay { id: String },
     /// The OS window's title; `None` restores the default.
@@ -980,6 +986,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
     });
     let props = inst.props.clone();
     let feedback_frame = inst.name == "frame-feedback";
+    let settings_frame = inst.name == "frame-settings";
     let feedback_from = inst.props.get("from").and_then(Value::as_str).unwrap_or("person").to_owned();
     let feedback_layout = inst.props.get("layout").and_then(Value::as_str).unwrap_or("other").to_owned();
     let (cmd_tx, commands) = async_channel::unbounded::<String>();
@@ -1017,6 +1024,36 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .function("appHome", |_| Ok(app_dir().to_string_lossy().into_owned().into()))
         .function("fonts", |_| Ok(to_host(&json!(*FONTS.lock().unwrap()))))
         .function("updates", |_| Ok(to_host(&crate::update::status())))
+        .function("quickTerminalShortcut", move |a| {
+            if !settings_frame {
+                return Err(HostError::new("Shortcut recording is only available in Settings"));
+            }
+            let action = a.get(0).and_then(|v| match v { HostValue::Str(s) => Some(s.as_str()), _ => None }).unwrap_or("poll");
+            if action == "validate" {
+                let shortcut = a.string(1)?;
+                if let Err(error) = crate::quick_terminal::validate_shortcut(shortcut) {
+                    return Ok(to_host(&json!({ "state": "error", "error": error })));
+                }
+                let status = json!({ "state": "valid", "shortcut": shortcut });
+                #[cfg(target_os = "macos")]
+                let status = {
+                    let mut status = status;
+                    if let Some(label) = crate::quick_terminal::shortcut_key_label(shortcut) {
+                        status["key_label"] = Value::String(label);
+                    }
+                    status
+                };
+                return Ok(to_host(&status));
+            }
+            if !matches!(action, "start" | "cancel" | "poll") {
+                return Ok(to_host(&json!({ "state": "error", "error": "Unknown shortcut recording action" })));
+            }
+            request(Request::ShortcutRecording { copy, action: action.into() });
+            if action == "start" {
+                return Ok(to_host(&json!({ "state": "recording", "ready": false, "phase": "idle" })));
+            }
+            Ok(to_host(&crate::quick_terminal::recording_status(copy)))
+        })
         .function("presentUpdateNotes", |a| {
             crate::update_notes::presented(&strings(a.get(0)));
             Ok(HostValue::Null)
@@ -1445,6 +1482,15 @@ mod tests {
             drop(reads);
             assert!(!snapshot_changed(1));
         }).join().unwrap();
+    }
+
+    #[test]
+    fn personal_mods_cannot_start_or_interrupt_shortcut_recording() {
+        let other = module(Instance { name: "personal".into(), props: Value::Null }, 812);
+        for action in ["start", "cancel", "poll"] {
+            let args = gpui_shell::HostArguments::new([HostValue::from(action)]);
+            assert!(other.call("quickTerminalShortcut", &args).is_err());
+        }
     }
 
     #[test]

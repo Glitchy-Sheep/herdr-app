@@ -103,6 +103,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("app.zoom_out", &[], "Make everything smaller."),
     cmd("app.zoom_reset", &[], "Back to normal size."),
     cmd("app.update", &[], "Restart into the update Herdr downloaded (your terminals keep running)."),
+    cmd("app.restart", &[], "Restart Herdr to apply saved settings; tabs and terminals keep running."),
     cmd("app.quit", &[], "Quit (macOS)."),
     cmd("app.hide", &[], "Hide the app (macOS)."),
     cmd("app.hide_others", &[], "Hide other apps (macOS)."),
@@ -110,6 +111,10 @@ pub const COMMANDS: &[Command] = &[
     cmd("window.close", &[], "Close the window (on Linux, quits)."),
     cmd("window.minimize", &[], "Minimize the window."),
     cmd("window.maximize", &[], "Maximize the window, or back."),
+    cmd("quick_terminal.toggle", &[], "Show or hide the enabled quick terminal on the current screen."),
+    cmd("quick_terminal.show", &[], "Show the enabled quick terminal."),
+    cmd("quick_terminal.hide", &[], "Hide the quick terminal and return to the previous app."),
+    cmd("quick_terminal.permissions", &[], "Open macOS Accessibility settings to allow the global double-modifier shortcut."),
 ];
 
 pub fn find(name: &str) -> Option<&'static Command> {

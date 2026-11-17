@@ -1,18 +1,19 @@
-// App-owned settings mod. Writes changes immediately; no Save step.
+// App-owned settings mod. Changes save immediately; shortcuts wait for key release.
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, InputState, Input, Popup } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window } from "herdr";
+import { v_flex, h_flex, Scrollbar, InputState, Input, Popup, Checkbox, Button } from "gpui-base";
+import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, quickTerminalShortcut } from "herdr";
 
 const I = (name) => `frame/settings/${name}.svg`;
 
 const SECTIONS = [
-  { id: "look", title: "Look", icon: "palette" },
-  ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", icon: "keyboard" }] : []),
-  { id: "machines", title: "Machines", icon: "server" },
-  { id: "alerts", title: "Alerts", icon: "bell" },
-  { id: "updates", title: "Updates", icon: "refresh" },
-  { id: "privacy", title: "Privacy", icon: "shield" },
+  { id: "look", title: "Look", icon: I("palette") },
+  { id: "quick-terminal", title: "Quick terminal", icon: "frame/welcome/terminal.svg" },
+  ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", icon: I("keyboard") }] : []),
+  { id: "machines", title: "Machines", icon: I("server") },
+  { id: "alerts", title: "Alerts", icon: I("bell") },
+  { id: "updates", title: "Updates", icon: I("refresh") },
+  { id: "privacy", title: "Privacy", icon: I("shield") },
 ];
 
 const LOOKS = { main: "Herdr", terminals: "Terminals", win98: "Herdr 98" };
@@ -25,6 +26,23 @@ const APPEARANCES = [
 // What the app uses when settings.json names no font (settings.rs).
 const DEFAULT_FONT = "JetBrains Mono";
 const DEFAULT_UI_FONT = "Geist";
+
+function shortcutKeys(value, mac) {
+  const text = String(value ?? "").trim().toLowerCase();
+  const names = { cmd: "Cmd", command: "Cmd", meta: "Cmd", super: mac ? "Cmd" : "Super", win: "Win", ctrl: "Ctrl", control: "Ctrl", alt: mac ? "Option" : "Alt", opt: "Option", option: "Option", shift: "Shift" };
+  const modifier = (name) => names[name] ?? name;
+  const double = text.match(/^double-(?:(left|right)-)?(.+)$/);
+  if (double) return [`${double[1] ? `${double[1] === "left" ? "Left" : "Right"} ` : ""}${modifier(double[2])}`, "×2"];
+  const side = text.match(/^(left|right)-(cmd|ctrl|alt|shift)$/);
+  if (side) return [`${side[1] === "left" ? "Left" : "Right"} ${modifier(side[2])}`];
+  const symbols = { Cmd: "⌘", Ctrl: "⌃", Option: "⌥", Shift: "⇧" };
+  const keys = { space: "Space", backquote: "`", grave: "`", backtick: "`", escape: "Esc", esc: "Esc", return: mac ? "Return" : "Enter", enter: mac ? "Return" : "Enter", tab: "Tab", backspace: mac ? "⌫" : "Backspace", left: "←", right: "→", up: "↑", down: "↓", minus: "-", equal: "=", bracketleft: "[", bracketright: "]", quote: "'", semicolon: ";", backslash: "\\", comma: ",", period: ".", slash: "/" };
+  return text.split(/[+-]/).filter(Boolean).map((part) => {
+    const name = names[part];
+    if (name) return (mac && symbols[name]) || name;
+    return keys[part] ?? (/^(?:[a-z0-9]|f\d+)$/.test(part) ? part.toUpperCase() : part);
+  });
+}
 
 export default class Settings extends View {
   init(_props, cx) {
@@ -44,6 +62,10 @@ export default class Settings extends View {
     });
     this.person = {};
     this.raw = null;
+    this.pendingWrites = 0;
+    this.restarting = false;
+    this.restartError = null;
+    this.permissionError = null;
     this.previews = {}; // layout name -> its "preview" picture
     this.previewsOf = "";
     this.showData = false;
@@ -55,6 +77,13 @@ export default class Settings extends View {
     this.machineEdit = null;
     this.machineNotice = null;
     this.handle = cx.focus_handle();
+    this.shortcutHandle = cx.focus_handle();
+    this.shortcutFocused = false;
+    this.shortcutEdit = null;
+    this.shortcutSaving = false;
+    this.shortcutAfterSave = null;
+    this.shortcutNotice = null;
+    this.shortcutNoticeUntil = 0;
     this.handle.focus();
     cx.spawn(async (cx) => {
       await this.load();
@@ -76,6 +105,7 @@ export default class Settings extends View {
         cx.notify();
       });
     });
+    cx.timer.every(100, (cx) => this.pollShortcut(cx));
   }
 
   file() {
@@ -115,22 +145,29 @@ export default class Settings extends View {
   // Changes settings.json the way an agent would: read, change, write back
   // only if nobody changed it meanwhile (else read again and redo). Says so
   // when it couldn't.
-  change(edit, cx) {
+  change(edit, cx, allowed) {
+    this.pendingWrites = (this.pendingWrites ?? 0) + 1;
+    cx.notify();
     cx.spawn(async (cx) => {
-      const failed = await this.save(edit);
-      if (failed) notify({ ...failed, level: "error" });
-      cx.notify();
+      try {
+        const failed = await this.save(edit, allowed);
+        if (failed) notify({ ...failed, level: "error" });
+      } finally {
+        this.pendingWrites--;
+        cx.notify();
+      }
     });
   }
 
   // The toast saying why `edit` wasn't written, or null once it is.
-  async save(edit) {
+  async save(edit, allowed) {
     let error;
     for (let attempt = 0; attempt < 3; attempt++) {
       let next;
       try {
         await this.load();
         if (this.broken) return { title: "settings.json has errors: fix it first" };
+        if (allowed && !allowed(this.person)) return null;
         next = JSON.parse(JSON.stringify(this.person));
         edit(next);
       } catch (e) {
@@ -147,8 +184,9 @@ export default class Settings extends View {
     return { title: "Not saved to settings.json", body: String(error?.message ?? error) };
   }
 
-  close() {
-    closeOverlay(props().overlay);
+  close(cx) {
+    if (cx) this.leaveShortcut(cx, () => closeOverlay(props().overlay));
+    else { this.cancelShortcut(); closeOverlay(props().overlay); }
   }
 
   // Pieces ---------------------------------------------------------------
@@ -177,9 +215,9 @@ export default class Settings extends View {
       .child(div().flex_none().child(control));
   }
 
-  button(t, id, label, onClick) {
-    return div()
-      .id(id)
+  button(t, id, label, onClick, component) {
+    const button = component ? component.new(id).accessibility_label(label) : div().id(id);
+    return button
       .px(12)
       .py(5)
       .rounded(7)
@@ -222,18 +260,19 @@ export default class Settings extends View {
       .child(b("plus", "+", onPlus));
   }
 
-  toggle(t, id, on, onClick) {
-    return div()
-      .id(id)
+  toggle(t, id, label, on, onChange, disabled = false) {
+    return Checkbox.new(id).role("switch").accessibility_label(label)
+      .checked(on)
+      .disabled(disabled)
       .w(36)
       .h(20)
       .rounded(10)
       .p(2)
-      .cursor_pointer()
+      .when(!disabled, (el) => el.cursor_pointer().on_change(onChange))
+      .when(disabled, (el) => el.opacity(0.5))
       .bg(on ? t.accent : t.hover)
       .flex()
       .when(on, (el) => el.justify_end())
-      .on_click(onClick)
       .child(div().w(16).h(16).rounded(8).bg(on ? t.accent_foreground : t.muted));
   }
 
@@ -592,6 +631,270 @@ export default class Settings extends View {
       }));
   }
 
+  startShortcut(cx) {
+    if (this.shortcutSaving) return;
+    this.shortcutNotice = null;
+    this.shortcutNoticeUntil = 0;
+    this.shortcutHandle.focus();
+    this.shortcutFocused = true;
+    const result = quickTerminalShortcut("start");
+    this.shortcutEdit = result?.state === "error" ? result : { state: "recording" };
+    cx.notify();
+  }
+
+  cancelShortcut(cx, restoreFocus = false) {
+    if (this.shortcutSaving) return;
+    if (!this.shortcutEdit) return;
+    quickTerminalShortcut("cancel");
+    this.shortcutEdit = null;
+    if (restoreFocus) this.handle.focus();
+    cx?.notify();
+  }
+
+  leaveShortcut(cx, after) {
+    if (this.shortcutSaving) {
+      if (after) this.shortcutAfterSave = after;
+      return;
+    }
+    if (this.shortcutEdit && ["recording", "recorded"].includes(this.shortcutEdit.state)) {
+      const result = quickTerminalShortcut();
+      if (result?.state === "recorded" && result.ready === true) {
+        this.saveShortcut(result, cx, after);
+        return;
+      }
+    }
+    this.cancelShortcut(cx);
+    after?.(cx);
+  }
+
+  pollShortcut(cx) {
+    if (this.shortcutNotice && Date.now() >= this.shortcutNoticeUntil) {
+      this.shortcutNotice = null;
+      cx.notify();
+    }
+    const focused = this.section === "quick-terminal" && this.shortcutHandle.is_focused();
+    const gainedFocus = focused && !this.shortcutFocused;
+    this.shortcutFocused = focused;
+    if (gainedFocus && !this.shortcutEdit && !this.shortcutSaving) {
+      this.startShortcut(cx);
+      return;
+    }
+    const edit = this.shortcutEdit;
+    if (!edit || this.shortcutSaving || !["recording", "recorded", "error"].includes(edit.state) || (edit.state === "error" && edit.ready !== false)) return;
+    const result = quickTerminalShortcut();
+    if (result?.state === "recorded" && result.ready === true) {
+      this.saveShortcut(result, cx);
+      return;
+    }
+    if (!focused) {
+      this.cancelShortcut(cx);
+      return;
+    }
+    if (!result || result.state === "idle") return;
+    if (result.state === "cancelled") {
+      this.cancelShortcut(cx, true);
+    } else if (JSON.stringify(result) !== JSON.stringify(edit)) {
+      this.shortcutEdit = result;
+      if (result.state === "error" && result.ready !== false) quickTerminalShortcut("cancel");
+      cx.notify();
+    }
+  }
+
+  saveShortcut(edit, cx, after) {
+    if (this.shortcutSaving || !edit.shortcut || edit.ready !== true) return;
+    const validation = quickTerminalShortcut("validate", edit.shortcut);
+    if (validation?.state !== "valid") {
+      quickTerminalShortcut("cancel");
+      this.shortcutEdit = { state: "error", error: validation?.error ?? "This shortcut is not supported. Try another one." };
+      if (after) {
+        notify({ title: "Shortcut was not changed", body: this.shortcutEdit.error, level: "error" });
+        after(cx);
+      }
+      cx.notify();
+      return;
+    }
+    this.shortcutEdit = edit;
+    this.shortcutSaving = true;
+    this.shortcutAfterSave = after ?? null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const failed = await this.save((person) => {
+        person.quick_terminal = { ...(person.quick_terminal ?? {}), shortcut: edit.shortcut };
+      });
+      this.shortcutSaving = false;
+      const afterSave = this.shortcutAfterSave;
+      this.shortcutAfterSave = null;
+      if (this.shortcutEdit === edit) {
+        if (failed) {
+          quickTerminalShortcut("cancel");
+          this.shortcutEdit = { state: "error", error: [failed.title, failed.body].filter(Boolean).join(". ") };
+        }
+        else {
+          this.cancelShortcut(cx, true);
+          this.shortcutNotice = "Saved · restart required";
+          this.shortcutNoticeUntil = Date.now() + 2500;
+        }
+      }
+      if (afterSave) {
+        if (failed) notify({ ...failed, level: "error" });
+        afterSave(cx, failed ? undefined : this.person.quick_terminal);
+      }
+      cx.notify();
+    });
+  }
+
+  shortcutField(t, mac, current) {
+    const edit = this.shortcutEdit;
+    const recording = edit?.state === "recording";
+    const recorded = edit?.state === "recorded";
+    const drainingError = edit?.state === "error" && edit.ready === false;
+    const value = recorded ? edit.shortcut : recording ? edit.preview : current;
+    const labels = shortcutKeys(value, mac);
+    if (mac && typeof value === "string" && !recording && !/^double-/i.test(value.trim())) {
+      const cap = quickTerminalShortcut("validate", value)?.key_label;
+      if (cap) labels[labels.length - 1] = /^[a-z]$/i.test(cap) ? cap.toUpperCase() : cap;
+    }
+    const hint = drainingError ? "Release keys to continue" : recorded ? "Release keys to save" : recording && labels.length ? edit.phase === "modifier-down" ? "Release, then tap again" : "Press again for ×2" : mac ? "Press a shortcut or tap one modifier twice" : "Press a shortcut or a function key";
+    const active = recording || recorded || drainingError;
+    const trailing = this.shortcutSaving ? "Saving…" : active ? "Esc" : this.shortcutNotice ?? "Click to change";
+    return v_flex().id("st-shortcut-editor").w_full().gap(8).py(12).border_b(1).border_color(t.border)
+      .on_mouse_down_out((_e, cx) => this.leaveShortcut(cx))
+      .child(div().text_size(14).text_color(t.foreground).child("Global shortcut"))
+      .child(h_flex().id("st-shortcut-field").track_focus(this.shortcutHandle).tab_index(0).role("button")
+        .accessibility_label(active ? `${labels.join(" + ")}. ${hint}. Escape cancels.` : `Global shortcut: ${labels.join(" + ")}. Click to change.`)
+        .w_full().min_h(44).px(12).py(8).gap(10).items_center().rounded(7).border_1()
+        .border_color(active ? t.accent : t.border).bg(t.background).cursor_pointer()
+        .hover((s) => s.bg(t.raised))
+        .on_click((_e, cx) => this.startShortcut(cx))
+        .on_key_down((e, cx) => {
+          if (!edit && ["enter", "space"].includes(e.key)) { this.startShortcut(cx); cx.stop_propagation(); }
+        })
+        .child(h_flex().flex_1().min_w(0).gap(5).items_center()
+          .children(labels.map((label) => div().px(7).py(3).rounded(4).border_1().border_color(t.border).bg(t.raised).text_size(13).text_color(t.foreground).child(label)))
+          .when(active && !this.shortcutSaving, (el) => el.child(div().min_w(0).ml(labels.length ? 5 : 0).text_size(12).text_color(t.dim).child(hint))))
+        .child(div().flex_none().text_size(12).text_color(active ? t.accent : t.dim).child(trailing)))
+      .when(Boolean(edit?.error), (el) => el.child(div().text_size(12).line_height("18px").text_color(t.blocked).child(edit.error)));
+  }
+
+  restartBlocked() {
+    const edit = this.shortcutEdit;
+    const capturing = edit && (["recording", "recorded"].includes(edit.state) || edit.ready === false);
+    return Boolean(this.restarting || this.pendingWrites || this.shortcutSaving || capturing);
+  }
+
+  restartOffer(permission = this.quickTerminalPermission()) {
+    const pending = window()?.restart_required;
+    if (pending && !this.quickConfig().enabled) permission = null;
+    if (permission?.granted && permission.restart_required) {
+      return { title: "Permission granted", about: "Restart to use the shortcut in other apps.", label: "Restart Herdr" };
+    }
+    if (permission?.recheck_available && !permission.granted) {
+      return { title: "Access still unconfirmed", about: "If Herdr.app is already allowed, restart to check again.", label: "Restart and recheck" };
+    }
+    if (pending) {
+      return { title: "Apply saved changes", about: "Your tabs and terminals keep running.", label: "Restart Herdr" };
+    }
+    return null;
+  }
+
+  quickConfig() {
+    return window()?.quick_terminal_config ?? this.person.quick_terminal ?? {};
+  }
+
+  quickTerminalPermission(config = this.quickConfig()) {
+    const host = window();
+    const permission = host?.quick_terminal_permission;
+    if (host?.platform !== "macos" || !permission || (permission.granted && !permission.restart_required)) return null;
+    const shortcut = config.shortcut ?? "double-cmd";
+    if (typeof shortcut !== "string" || !/^double-/i.test(shortcut.trim())) return null;
+    return quickTerminalShortcut("validate", shortcut)?.state === "valid" ? permission : null;
+  }
+
+  openQuickTerminalPermissions(cx) {
+    if (this.restarting || this.pendingWrites || this.shortcutSaving) return;
+    this.leaveShortcut(cx, (_cx, saved) => {
+      const permission = this.quickTerminalPermission(saved);
+      if (!permission || permission.granted) return;
+      this.handle.focus();
+      this.permissionError = null;
+      try {
+        run("quick_terminal.permissions");
+      } catch (error) {
+        this.permissionError = String(error?.message ?? error);
+      }
+      cx.notify();
+    });
+  }
+
+  quickTerminalPermissionNotice(t) {
+    const busy = Boolean(this.restarting || this.pendingWrites || this.shortcutSaving);
+    return v_flex().id("st-quick-permission-notice").w_full().gap(8).p(12).mt(8).rounded(8).border_1().border_color(t.working).bg(t.raised)
+      .child(div().text_size(14).font_semibold().text_color(t.foreground).child("Allow double-tap shortcuts"))
+      .child(div().text_size(12.5).line_height("18px").text_color(t.foreground).child("For double taps in other apps, allow Herdr.app under Device Control and Data Access (Accessibility on older macOS versions). Or use a shortcut like Ctrl + Option + Space."))
+      .child(h_flex().child(this.button(t, "st-quick-permissions", "Open System Settings", (_e, cx) => this.openQuickTerminalPermissions(cx), Button)
+        .disabled(busy).when(busy, (el) => el.opacity(0.5))))
+      .when(Boolean(this.permissionError), (el) => el.child(div().text_size(12).line_height("18px").text_color(t.blocked).child(this.permissionError)));
+  }
+
+  restartHerdr(cx) {
+    if (!this.restartOffer() || this.restartBlocked()) return;
+    this.restarting = true;
+    this.restartError = null;
+    cx.notify();
+    try {
+      run("app.restart");
+      cx.timer.after(3000, (cx) => {
+        this.restarting = false;
+        cx.notify();
+      });
+    } catch (error) {
+      this.restarting = false;
+      this.restartError = String(error?.message ?? error);
+      cx.notify();
+    }
+  }
+
+  quickTerminal(t) {
+    const q = this.quickConfig();
+    const mac = window()?.platform === "macos";
+    const shortcut = q.shortcut ?? (mac ? "double-cmd" : "ctrl-alt-backquote");
+    const set = (key, value, cx, allowed) => this.change((p) => {
+      p.quick_terminal = { ...(p.quick_terminal ?? {}), [key]: value };
+    }, cx, allowed);
+    const restartBlocked = this.restartBlocked();
+    const permission = this.quickTerminalPermission();
+    const needsPermission = permission?.granted === false;
+    const runtimeError = q.enabled && window()?.quick_terminal_error;
+    const blocked = Boolean(needsPermission || runtimeError);
+    const changeEnabled = (enabled, cx) => {
+      if (this.quickTerminalPermission()?.granted === false || (this.quickConfig().enabled && window()?.quick_terminal_error)) return;
+      set("enabled", enabled, cx, (p) => !enabled || this.quickTerminalPermission(p.quick_terminal ?? {})?.granted !== false);
+    };
+    const offer = this.restartOffer(permission);
+    const restartLabel = this.restarting ? "Restarting…" : this.pendingWrites || this.shortcutSaving ? "Saving…" : offer?.label;
+    return v_flex().w_full()
+      .child(this.heading(t, "Quick terminal"))
+      .child(this.row(t, "Enable quick terminal", blocked ? null : "Show or hide Herdr from any app. Hidden tabs keep running.",
+        h_flex().items_center().gap(10)
+          .when(blocked && Boolean(q.enabled), (el) => el.child(this.button(t, "st-quick-disable", "Use regular window", (_e, cx) => set("enabled", false, cx), Button)))
+          .child(this.toggle(t, "st-quick-enable", "Enable quick terminal", !blocked && Boolean(q.enabled), changeEnabled, blocked))))
+      .when(Boolean(runtimeError), (el) => el.child(div().id("st-quick-runtime-error").py(8).text_size(13).text_color(t.blocked).child(runtimeError)))
+      .when(needsPermission, (el) => el.child(this.quickTerminalPermissionNotice(t)))
+      .when(Boolean(offer), (el) => el.child(this.row(t, offer.title, this.restartError ?? offer.about,
+        this.button(t, "st-quick-restart", restartLabel, (_e, cx) => this.restartHerdr(cx), Button)
+          .bg(t.accent).border_color(t.accent).text_color(t.accent_foreground).hover((s) => s.bg(t.accent).opacity(0.9))
+          .disabled(restartBlocked).when(restartBlocked, (el) => el.opacity(0.5)))))
+      .child(this.shortcutField(t, mac, shortcut))
+      .child(this.row(t, "Hide when switching apps", "When off, Herdr stays above other windows.", this.toggle(t, "st-quick-blur", "Hide when switching apps", q.auto_hide ?? true, (enabled, cx) => set("auto_hide", enabled, cx))))
+      .child(div().pt(12).child(this.heading(t, "Initial size")))
+      .child(div().text_size(12.5).line_height("18px").text_color(t.dim).child("Percent of the usable screen. Changes reset the saved window size on restart."))
+      .children([["height", "Height", 0.6], ["width", "Width", 1]].map(([key, label, fallback]) => {
+        const value = q[key] ?? fallback;
+        const step = (delta) => (_e, cx) => set(key, Math.min(1, Math.max(0.1, Math.round(value * 10 + delta) / 10)), cx);
+        return this.row(t, label, null, this.stepper(t, `st-quick-${key}`, `${Math.round(value * 100)}%`, step(-1), step(1)));
+      }));
+  }
+
   // Machines -------------------------------------------------------------
 
   async loadMachines() {
@@ -749,7 +1052,7 @@ export default class Settings extends View {
           t,
           "Play sounds",
           "When an agent needs you, and when one finishes while you're not looking. A note shows in the corner either way.",
-          this.toggle(t, "st-sounds", on, (_e, cx) => this.change((p) => (p.sounds = { ...(p.sounds ?? {}), enabled: !on }), cx)),
+          this.toggle(t, "st-sounds", "Play sounds", on, (_e, cx) => this.change((p) => (p.sounds = { ...(p.sounds ?? {}), enabled: !on }), cx)),
         ),
       )
       .child(this.row(t, "An agent needs you", file(sounds.blocked), this.button(t, "st-play-blocked", "Play", () => playSound("blocked"))))
@@ -854,7 +1157,7 @@ export default class Settings extends View {
           t,
           "Share anonymous usage data",
           why ?? "Once a day: which agents and features you use, how many spaces and tabs, your system and Herdr's version. Never what's in your terminals, never names of files, folders or projects.",
-          this.toggle(t, "st-telemetry", on, (_e, cx) =>
+          this.toggle(t, "st-telemetry", "Share anonymous usage data", on, (_e, cx) =>
             this.change((p) => {
               if (on) p.telemetry = false;
               else delete p.telemetry;
@@ -908,15 +1211,15 @@ export default class Settings extends View {
             .cursor_pointer()
             .bg(on ? t.raised : "#00000000")
             .hover((st) => st.bg(t.raised))
-            .on_click((_e, cx) => {
+            .on_click((_e, cx) => this.leaveShortcut(cx, (cx) => {
               this.section = s.id;
               this.picking = null;
               this.machineEdit = null;
               this.handle.focus();
               if (s.id === "machines") cx.spawn(async (cx) => { await this.loadMachines(); cx.notify(); });
               cx.notify();
-            })
-            .child(svg(I(s.icon)).size(15).text_color(on ? t.accent : t.dim))
+            }))
+            .child(svg(s.icon).size(15).text_color(on ? t.accent : t.dim))
             .child(div().flex_1().text_size(13.5).text_color(on ? t.foreground : t.muted).child(s.title))
             .when(s.id === "updates" && waiting, (el) => el.child(div().w(7).h(7).rounded(4).bg(t.accent)));
         }),
@@ -930,12 +1233,21 @@ export default class Settings extends View {
         cx.stop_propagation();
         cx.notify();
       }))
+      .when(Boolean(this.shortcutEdit), (el) => el.on_action("overlay.close", (_e, cx) => {
+        this.cancelShortcut(cx, true);
+        cx.stop_propagation();
+      }))
       .w_full()
       .h(620)
       .min_h(0)
       .items_start()
       .on_key_down((e, cx) => {
         const k = e.key;
+        if (this.shortcutEdit && k === "escape") {
+          this.cancelShortcut(cx, true);
+          cx.stop_propagation();
+          return;
+        }
         if (this.machineEdit) {
           if (k === "escape") this.machineEdit = null;
           else return;
@@ -946,13 +1258,13 @@ export default class Settings extends View {
         }
         if (k === "escape") {
           if (this.picking) this.picking = null;
-          else return this.close();
+          else return this.close(cx);
           this.handle.focus();
         } else return;
         cx.stop_propagation();
         cx.notify();
       })
-      .child(nav.h_full().child(div().flex_1()).child(this.button(t, "st-feedback", "Send feedback", () => { closeOverlay(props()?.overlay); run("app.feedback"); })))
+      .child(nav.h_full().child(div().flex_1()).child(this.button(t, "st-feedback", "Send feedback", (_e, cx) => this.leaveShortcut(cx, () => { closeOverlay(props()?.overlay); run("app.feedback"); }))))
       .child(
         // A bar that always shows: the pages are taller than the dialog and
         // people should see that they scroll.
@@ -975,6 +1287,8 @@ export default class Settings extends View {
                   .child(
                     this.section === "look"
                       ? this.look(t, cx)
+                      : this.section === "quick-terminal"
+                        ? this.quickTerminal(t)
                       : this.section === "keyboard"
                         ? this.keyboard(t)
                       : this.section === "machines"

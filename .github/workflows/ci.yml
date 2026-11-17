@@ -78,7 +78,8 @@ jobs:
           scripts/ci-apt \
             pkg-config clang libclang-dev \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libvulkan-dev mesa-vulkan-drivers libfontconfig-dev libfreetype-dev
+            libvulkan-dev mesa-vulkan-drivers libfontconfig-dev libfreetype-dev \
+            xvfb xauth openbox x11-xkb-utils
       - name: Windows build dependencies
         if: runner.os == 'Windows'
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
@@ -120,16 +121,24 @@ jobs:
         env:
           HERDR_SHOT_NATIVE_TEST: "1"
         run: cargo test --locked --config 'profile.dev.package."*".opt-level=0' --test shot_pixels
+      - name: Quick terminal on an isolated X11 display
+        if: runner.os == 'Linux'
+        run: bash tests/quick_terminal_platform/run-x11.sh --host
+      - name: Quick terminal on a private Windows test window
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked --manifest-path tests/quick_terminal_platform/Cargo.toml
+          cargo run --locked --manifest-path tests/quick_terminal_platform/Cargo.toml
       - name: Check release packaging
         if: matrix.platform == 'linux-x86_64'
         run: python3 -m unittest discover -s scripts -p test_distribution.py
       - name: Install Bun
         if: matrix.platform == 'linux-x86_64'
         run: curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.4"
-      - name: Check documentation
+      - name: Check settings, shortcuts and documentation
         if: matrix.platform == 'linux-x86_64'
         run: |
-          ~/.bun/bin/bun test scripts/docs.test.ts
+          ~/.bun/bin/bun test scripts/settings.test.ts scripts/shortcut.test.ts scripts/docs.test.ts
           ~/.bun/bin/bun scripts/docs.ts check
 
   # Keep the required check name stable while requiring every platform.

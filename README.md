@@ -88,6 +88,8 @@ Linux and Windows keep Ctrl+A for the shell; bind `terminal.select_all` in `keys
 
 [Layouts and mods](docs/mods.md) · [Commands](docs/commands.md)
 
+Settings > Quick terminal enables a global shortcut to show and hide Herdr above your work. The default is double Cmd on macOS and Ctrl+Alt+backquote on Windows and X11. Changes require a restart. See [Quick terminal](docs/quick-terminal.md) for permissions, configuration and platform limits.
+
 ## Updates and privacy
 
 Installed releases check for updates in the background and download a new app beside the running one. It takes over when you quit and reopen, or choose the update action. Your terminals keep running in the core.

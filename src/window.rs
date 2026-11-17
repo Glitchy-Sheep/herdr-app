@@ -435,6 +435,9 @@ pub struct AppWindow {
     written_view: String,
     /// settings.json: zoom and sounds.
     person: settings::Person,
+    quick_terminal: crate::quick_terminal::QuickTerminal,
+    quick_terminal_permission: Option<crate::quick_terminal::Permission>,
+    quick_terminal_permission_notified: bool,
     /// What the last command made or why it didn't (for callers that wait for it).
     reply: Option<Value>,
     /// The `where` label last written per terminal address.
@@ -503,12 +506,12 @@ pub struct AppWindow {
 }
 
 impl AppWindow {
-    pub fn new(core: Arc<Core>, requests: async_channel::Receiver<Request>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(core: Arc<Core>, requests: async_channel::Receiver<Request>, quick_terminal: crate::quick_terminal::QuickTerminal, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let file_events = crate::files::watch(&mods::app_dir(), #[cfg(test)] cx.background_executor().clone());
-        Self::with_file_events(core, requests, file_events, window, cx)
+        Self::with_file_events(core, requests, file_events, quick_terminal, window, cx)
     }
 
-    fn with_file_events(core: Arc<Core>, requests: async_channel::Receiver<Request>, file_events: Option<crate::files::FileEvents>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn with_file_events(core: Arc<Core>, requests: async_channel::Receiver<Request>, file_events: Option<crate::files::FileEvents>, quick_terminal: crate::quick_terminal::QuickTerminal, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let runtime = ShellRuntime::new(cx).map_err(|e| tracing::error!("script runtime failed, mods are off: {e:#}")).ok();
         if let (Some(runtime), Some(events)) = (&runtime, &file_events) {
             runtime.set_source_revision_provider(events.revision_provider());
@@ -552,6 +555,9 @@ impl AppWindow {
             layout_file_ok: true,
             written_view: String::new(),
             person: settings::Person::default(),
+            quick_terminal,
+            quick_terminal_permission: None,
+            quick_terminal_permission_notified: false,
             reply: None,
             written_where: HashMap::new(),
             written_seen: HashMap::new(),
@@ -603,12 +609,21 @@ impl AppWindow {
         };
         w._focus_lost = Some(cx.on_focus_lost(window, |this, window, cx| this.restore_focus(window, cx)));
         w._place = Some(cx.observe_window_bounds(window, |this, window, cx| {
-            if let Some(t) = crate::place::changed(window, cx) {
+            if this.quick_terminal.enabled() {
+                if let Some(task) = this.quick_terminal.resized(cx) { this.place_write = Some(task); }
+                return;
+            }
+            if this.quick_terminal.error().is_none() && let Some(t) = crate::place::changed(window, cx) {
                 this.place_write = Some(t);
             }
         }));
         let closing = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
+            if closing.update(cx, |this, _| {
+                if !this.quick_terminal.enabled() { return false; }
+                let _ = this.quick_terminal.run("quick_terminal.hide");
+                true
+            }).unwrap_or(false) { return false; }
             // macOS: the red button hides the app instead, so alerts keep ringing;
             // the Dock icon or a new launch brings it back, Cmd+Q quits.
             if cfg!(target_os = "macos") {
@@ -618,13 +633,19 @@ impl AppWindow {
             let _ = closing.update(cx, |this, cx| {
                 this.drain_documents(window, cx);
                 this.close_mods_now(std::time::Instant::now() + Duration::from_millis(250), window, cx);
+                this.save_window_place(window, cx);
             });
-            crate::place::save(window, cx);
             true
         });
         settings::install_themes();
         crate::programs::install_icons();
         w.reload_config(window, cx);
+        w.quick_terminal_permission = Some(w.quick_terminal.permission(&w.person.quick_terminal));
+        if let Some(error) = w.quick_terminal.error() {
+            w.report("quick_terminal", error);
+        } else {
+            let _ = std::fs::remove_file(file("quick_terminal.error"));
+        }
         install_layouts();
         let name = mods::shared("layout").and_then(|v| v.as_str().map(str::to_owned)).filter(|n| layout_path(n).exists());
         // A layout whose mods are gone (Zen, T4, ADE after the update took
@@ -913,6 +934,24 @@ impl AppWindow {
 
     // ---- config files ------------------------------------------------------
 
+    pub fn save_window_place(&self, window: &Window, cx: &App) {
+        if self.quick_terminal.enabled() { self.quick_terminal.save_size(); }
+        // A temporary fallback preserves the ordinary window's saved placement.
+        else if self.quick_terminal.error().is_none() { crate::place::save(window, cx); }
+    }
+
+    pub fn show_initial_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_terminal.enabled() {
+            if let Err(error) = self.quick_terminal.run("quick_terminal.show") {
+                self.report("quick_terminal", &error);
+                window.activate_window();
+            }
+        } else {
+            cx.activate(true);
+            window.activate_window();
+        }
+    }
+
     /// Changes settings.json from inside the app (the zoom keys). If the file
     /// is broken mid-edit, the change applies for now without touching it.
     fn write_person(&mut self, change: impl FnOnce(&mut settings::Person), window: &mut Window, cx: &mut Context<Self>) {
@@ -955,8 +994,12 @@ impl AppWindow {
             crate::telemetry::set_setting(settings::telemetry_setting(&loaded));
             match loaded {
                 Ok(p) => {
+                    self.quick_terminal.set_auto_hide(p.quick_terminal.auto_hide);
                     self.person = p;
                     let _ = std::fs::remove_file(file("settings.error"));
+                    if mods::publish_window(self.window_json(window)) {
+                        self.refresh_snapshot_mods(cx);
+                    }
                 }
                 Err(e) => self.report("settings", &e),
             }
@@ -2978,6 +3021,18 @@ impl AppWindow {
         if let Err(error) = crate::commands::validate_args(command, &args) {
             return json!({ "error": error });
         }
+        if name == "quick_terminal.permissions" {
+            return match self.quick_terminal.open_permission_settings(&self.person.quick_terminal) {
+                Ok(()) => json!({ "ok": true }),
+                Err(error) => json!({ "error": error }),
+            };
+        }
+        if name.starts_with("quick_terminal.") {
+            return match self.quick_terminal.run(name) {
+                Ok(()) => json!({ "ok": true, "visible": self.quick_terminal.visible() }),
+                Err(error) => json!({ "error": error }),
+            };
+        }
         // pane.go from a mod block starts at the block, not at the terminal block focused before it.
         if terminal_block(&self.chrome, self.focused_pane.as_deref()).is_some()
             && needs_model_pane(name, &args)
@@ -3642,6 +3697,19 @@ impl AppWindow {
                 self.write_person(|p| p.zoom = zoom, window, cx);
             }
             "app.quit" => cx.quit(),
+            "app.restart" => {
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = cx.background_executor().spawn(async { crate::restart::prepare() }).await;
+                    let _ = this.update_in(cx, |this, window, cx| match result {
+                        Ok(true) => {
+                            this.drain_documents(window, cx);
+                            cx.quit();
+                        }
+                        Ok(false) => {}
+                        Err(error) => this.command_error("app.restart", &error, window, cx),
+                    });
+                }).detach();
+            }
             "app.update" => {
                 match crate::update::apply() {
                     Ok(true) => {}
@@ -3983,6 +4051,9 @@ impl AppWindow {
 
     fn remove_overlay(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(i) = self.overlays.iter().position(|o| o.id == id) {
+            if self.quick_terminal.record_owner().is_some_and(|owner| self.copies.get(&self.overlays[i].slot).is_some_and(|copy| copy.id == owner)) {
+                self.quick_terminal.cancel_recording();
+            }
             let o = self.overlays.remove(i);
             if self.win_drag.as_ref().is_some_and(|d| d.id == o.id) {
                 self.win_drag = None;
@@ -4033,6 +4104,41 @@ impl AppWindow {
     fn handle(&mut self, req: Request, window: &mut Window, cx: &mut Context<Self>) {
         match req {
             Request::Run { name, args } => self.run(&name, args, window, cx),
+            Request::QuickTerminalAutoHide => {
+                self.reload_config(window, cx);
+                if let Err(error) = self.quick_terminal.hide_on_blur() {
+                    self.report("quick_terminal", &error);
+                }
+            }
+            Request::ShortcutRecording { copy, action } => {
+                if action == "start" {
+                    let focused = self.overlays.iter().any(|overlay| overlay.id == "settings"
+                        && self.copies.get(&overlay.slot).is_some_and(|current| current.id == copy && current.inst.name == "frame-settings")
+                        && overlay.focus.contains_focused(window, cx));
+                    if !focused || !window.is_window_active() {
+                        crate::quick_terminal::recording_error(copy, "Focus the shortcut field in Settings first");
+                    } else if let Err(error) = self.quick_terminal.start_recording(copy, window, cx) {
+                        crate::quick_terminal::recording_error(copy, error);
+                    }
+                } else if self.quick_terminal.record_owner() == Some(copy) {
+                    if action == "cancel" { self.quick_terminal.cancel_recording(); }
+                    else { self.quick_terminal.poll_recording(window); }
+                }
+                cx.notify();
+            }
+            #[cfg(not(target_os = "macos"))]
+            Request::ShortcutRecorded { shortcut } => {
+                self.quick_terminal.poll_recording(window);
+                self.quick_terminal.recorded_shortcut(&shortcut);
+                cx.notify();
+            }
+            #[cfg(not(target_os = "macos"))]
+            Request::QuickTerminalShortcutError(error) => {
+                self.quick_terminal.set_shortcut_error(error);
+                if mods::publish_window(self.window_json(window)) {
+                    self.refresh_snapshot_mods(cx);
+                }
+            }
             Request::OpenOverlay { id, spec } => self.open_overlay(id, spec, window, cx),
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::SetWindowTitle(title) => window.set_window_title(title.as_deref().unwrap_or("Herdr")),
@@ -4054,6 +4160,9 @@ impl AppWindow {
         }
         // Herdr was launched again: this window comes to the front instead.
         if cmd.get("raise").is_some() {
+            if self.quick_terminal.enabled() {
+                return self.run_as("quick_terminal.show", Value::Null, false, window, cx);
+            }
             cx.activate(true);
             window.activate_window();
             return json!({ "ok": true });
@@ -4062,8 +4171,9 @@ impl AppWindow {
             return self.world();
         }
         if cmd.get("status").is_some() {
+            let permission = self.quick_terminal.permission(&self.person.quick_terminal);
             let round = |v: f32| (v as f64 * 100.0).round() / 100.0;
-            let errors: Vec<String> = ["settings", "keys", "layout", "programs"]
+            let errors: Vec<String> = ["settings", "keys", "layout", "programs", "quick_terminal"]
                 .iter()
                 .filter_map(|w| std::fs::read_to_string(file(&format!("{w}.error"))).ok())
                 .chain(self.copies.values().filter_map(|c| Some(format!("mod {}: {}", c.inst.name, c.error.as_ref()?))))
@@ -4071,6 +4181,8 @@ impl AppWindow {
                 .collect();
             return json!({
                 "zoom": round(settings::zoom()),
+                "restart_required": self.quick_terminal.restart_required(&self.person.quick_terminal),
+                "quick_terminal": { "enabled": self.quick_terminal.enabled(), "visible": self.quick_terminal.visible(), "auto_hide": self.quick_terminal.auto_hide(), "error": self.quick_terminal.error(), "warning": self.quick_terminal.warning(&permission), "permission": permission, "native": self.quick_terminal.diagnostics() },
                 "font_size": round(settings::font_size()),
                 "ui_font_size": round(settings::ui_font_size()),
                 "space": self.model.active,
@@ -4135,6 +4247,7 @@ impl AppWindow {
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_documents(false, window, cx);
+        self.poll_quick_terminal_permission(window, cx);
         let ready = Self::update_label();
         if ready != self.update_ready {
             self.update_ready = ready;
@@ -4166,6 +4279,10 @@ impl AppWindow {
         for id in expired {
             self.close_overlay(&id, window, cx);
         }
+        if self.quick_terminal.record_owner().is_some_and(|owner| !self.copies.values().any(|copy| copy.id == owner)) {
+            self.quick_terminal.cancel_recording();
+        }
+        self.quick_terminal.poll_recording(window);
         let active = window.is_window_active();
         if active != self.window_active {
             self.window_active = active;
@@ -4185,6 +4302,39 @@ impl AppWindow {
         if dark != self.system_dark {
             self.system_dark = dark;
             self.apply_look(window, cx);
+        }
+    }
+
+    fn poll_quick_terminal_permission(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings_open = self.overlays.iter().any(|overlay| overlay.id == "settings");
+        if !self.quick_terminal.should_poll_permission(&self.person.quick_terminal, settings_open)
+            && !self.quick_terminal_permission.is_some_and(|p| p.required || p.recheck_available) {
+            return;
+        }
+        let permission = self.quick_terminal.permission(&self.person.quick_terminal);
+        let bring_back = self.quick_terminal.should_return_from_permission_settings(&permission, &self.person.quick_terminal);
+        if self.quick_terminal_permission.as_ref() != Some(&permission) {
+            self.quick_terminal_permission = Some(permission);
+            if mods::publish_window(self.window_json(window)) {
+                self.refresh_snapshot_mods(cx);
+            }
+        }
+        if !permission.required || permission.granted {
+            self.quick_terminal_permission_notified = false;
+            self.close_overlay("quick-terminal-permission", window, cx);
+            if bring_back {
+                self.show_initial_window(window, cx);
+                self.run_as("app.settings", json!({ "section": "quick-terminal" }), false, window, cx);
+            }
+        } else if !self.quick_terminal_permission_notified && window.is_window_active() {
+            self.quick_terminal_permission_notified = true;
+            let note = json!({
+                "title": "Allow Herdr's global shortcut",
+                "body": "Accessibility permission is missing. Click to set it up.",
+                "level": "warning", "timeout": 15000,
+                "action": { "name": "app.settings", "args": { "section": "quick-terminal" } },
+            });
+            self.open_overlay("quick-terminal-permission".into(), json!({ "kind": "toast", "notification": note }), window, cx);
         }
     }
 
@@ -5359,7 +5509,8 @@ impl Render for AppWindow {
                 }
             }))
             // Ctrl (Cmd) alone shows links in the pane under the pointer, focused or not.
-            .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, _, cx| {
+            .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, window, cx| {
+                this.quick_terminal.poll_recording(window);
                 for t in this.terms.values() {
                     if t.view.read(cx).hovered() {
                         t.view.update(cx, |_, cx| cx.notify());
@@ -5375,6 +5526,9 @@ impl Render for AppWindow {
                         cx.stop_propagation();
                     }
                 }
+            }))
+            .capture_key_up(cx.listener(|this, ev: &KeyUpEvent, window, cx| {
+                if this.quick_terminal.recording_key_up(ev, window) { cx.stop_propagation(); }
             }))
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, _| this.pointer = ev.position))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
@@ -6184,6 +6338,39 @@ mod tests {
         std::env::var("HERDR_TEST_WINDOW").as_deref() == Ok(name)
     }
 
+    #[test]
+    fn a_failed_quick_terminal_opens_the_saved_ordinary_window() {
+        in_own_process("quick_terminal_fallback_window");
+    }
+
+    #[gpui::test]
+    fn quick_terminal_fallback_window(cx: &mut TestAppContext) {
+        if !running_alone("quick_terminal_fallback_window") { return; }
+        let home = crate::mods::app_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("settings.json"), r#"{"quick_terminal":{"enabled":true,"shortcut":"ctrl-alt-space"}}"#).unwrap();
+        let placement = r#"{"state":"windowed","bounds":[30,40,740,460]}"#;
+        std::fs::write(home.join("window.json"), placement).unwrap();
+        cx.update(crate::mods::init);
+        let existing = cx.add_window(|_, _| gpui::Empty);
+        cx.update(|cx| {
+            let requests = crate::mods::install_policy();
+            crate::open_main(crate::hc::offline(), requests, cx);
+            let windows = cx.windows();
+            assert_eq!(windows.len(), 2);
+            assert!(windows.contains(&existing.into()));
+            let main = windows.iter().find_map(|w| w.downcast::<super::AppWindow>()).unwrap();
+            main.update(cx, |app, window, cx| {
+                assert!(app.quick_terminal.error().is_some());
+                assert!(!app.quick_terminal.enabled());
+                assert_eq!(window.bounds().size, size(px(740.), px(460.)));
+                assert!(!app.quick_terminal.restart_required(&app.person.quick_terminal));
+                app.save_window_place(window, cx);
+            }).unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(home.join("window.json")).unwrap(), placement);
+    }
+
     /// The window on a core that's never there (`hc::offline`), showing
     /// `layout` with `mod_name` (its `main.js`) in the home, past the first-run
     /// welcome (it lists machines through the core). No other mods: the
@@ -6207,7 +6394,7 @@ mod tests {
         let requests = crate::mods::install_policy();
         crate::mods::set_shared("layout".into(), json!("test"));
         crate::mods::set_shared("frame.welcomed".into(), json!("test"));
-        let (view, cx) = cx.add_window_view(|window, cx| super::AppWindow::with_file_events(core, requests, Some(crate::files::FileEvents::for_test(home.clone())), window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| super::AppWindow::with_file_events(core, requests, Some(crate::files::FileEvents::for_test(home.clone())), Default::default(), window, cx));
         assert_eq!(view.update(cx, |this, _| this.layout_name.clone()), "test");
         (view, cx)
     }

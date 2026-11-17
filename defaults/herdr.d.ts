@@ -91,6 +91,18 @@ export function playSound(sound: string): null;
  */
 export function run(name: string, args?: Record<string, unknown>): null;
 
+/** Settings-only shortcut recorder. A complete shortcut is ready after all keys are released. The caller validates and saves it. Escape, focus loss and closing Settings cancel incomplete capture. */
+export function quickTerminalShortcut(action?: "start" | "cancel" | "validate", shortcut?: string): {
+  state: "idle" | "recording" | "recorded" | "cancelled" | "error" | "valid";
+  shortcut?: string;
+  /** Current macOS keyboard layout's label for the printable key of a valid chord. */
+  key_label?: string;
+  preview?: string;
+  ready?: boolean;
+  phase?: "idle" | "modifier-down" | "awaiting-second-tap" | "releasing" | "complete";
+  error?: string;
+};
+
 export type Status = "working" | "blocked" | "done" | "idle";
 
 /** A named piece of work in a space: shared through that machine's core doc.
@@ -296,6 +308,21 @@ export function window(): {
   maximized: boolean;
   fullscreen: boolean;
   active: boolean;
+  /** Saved settings differ from the running quick terminal's mode, shortcut or initial size. */
+  restart_required: boolean;
+  /** Last valid quick-terminal preferences, including defaults for omitted fields. */
+  quick_terminal_config: { enabled: boolean; shortcut: string; width: number; height: number; auto_hide: boolean };
+  /** Native quick-terminal initialization or shortcut error shown in Settings. */
+  quick_terminal_error: string | null;
+  /** Last observed macOS Accessibility permission. Updates while the shortcut needs it or Settings checks access. */
+  quick_terminal_permission: {
+    required: boolean;
+    granted: boolean;
+    /** Access was granted after the global monitor started; restart to activate it. */
+    restart_required: boolean;
+    /** Herdr can recheck access on restart after a visit to System Settings, even before the mode is enabled. */
+    recheck_available: boolean;
+  };
 };
 
 /** Sets the OS window's title, which window switchers, taskbars and time trackers read. The last

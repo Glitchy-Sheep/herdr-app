@@ -3701,6 +3701,8 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64",
+ "block",
+ "cocoa 0.26.0",
  "fancy-regex 0.19.2",
  "ghostty-sys",
  "gpui-base",
@@ -3714,6 +3716,7 @@ dependencies = [
  "image",
  "libc",
  "notify",
+ "objc",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -3732,6 +3735,7 @@ dependencies = [
  "uds_windows",
  "windows-sys 0.61.2",
  "winresource",
+ "x11rb",
 ]
 
 [[package]]

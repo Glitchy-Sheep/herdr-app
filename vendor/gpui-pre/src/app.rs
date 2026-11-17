@@ -1444,6 +1444,15 @@ impl App {
         options: crate::WindowOptions,
         build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
     ) -> anyhow::Result<WindowHandle<V>> {
+        self.try_open_window(options, |window, cx| Ok(build_root_view(window, cx)))
+    }
+
+    /// HERDR: discard a native window if its root cannot be initialized.
+    pub fn try_open_window<V: 'static + Render>(
+        &mut self,
+        options: crate::WindowOptions,
+        build_root_view: impl FnOnce(&mut Window, &mut App) -> anyhow::Result<Entity<V>>,
+    ) -> anyhow::Result<WindowHandle<V>> {
         self.update(|cx| {
             let id = cx.windows.insert(None);
             let handle = WindowHandle::new(id);
@@ -1452,6 +1461,13 @@ impl App {
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
                     cx.window_update_stack.pop();
+                    let root_view = match root_view {
+                        Ok(root) => root,
+                        Err(error) => {
+                            cx.windows.remove(id);
+                            return Err(error);
+                        }
+                    };
                     window.root.replace(root_view.into());
                     window.defer(cx, |window: &mut Window, cx| window.appearance_changed(cx));
 

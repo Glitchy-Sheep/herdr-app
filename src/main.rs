@@ -27,7 +27,9 @@ mod mod_files;
 mod process_cwd;
 mod programs;
 mod remote_shell;
+mod restart;
 mod settings;
+mod quick_terminal;
 mod setup;
 mod sound;
 mod spawn;
@@ -85,6 +87,7 @@ fn attach_console() {
 }
 
 fn main() {
+    let restarting = restart::resuming();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "macos")]
     macos_check::startup(&args);
@@ -125,7 +128,7 @@ fn main() {
         .init();
 
     update::leave_install_folder();
-    if update::apply_on_startup() {
+    if !restarting && update::apply_on_startup() {
         return;
     }
 
@@ -161,10 +164,17 @@ fn main() {
         eprintln!("herdr-app: cannot write {}: {e}", mods::app_dir().display());
     }
 
-    gpui_platform::application()
+    let app = gpui_platform::application()
         // Mods run programs already; the user's own links (dotfiles, Nix) may point out.
-        .with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links())
-        .run(move |cx| {
+        .with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links());
+    app.on_reopen(|cx| {
+            for handle in cx.windows() {
+                if let Some(handle) = handle.downcast::<window::AppWindow>() {
+                    let _ = handle.update(cx, |this, window, cx| this.show_initial_window(window, cx));
+                }
+            }
+        });
+    app.run(move |cx| {
             let fonts = settings::BUNDLED_FONTS.iter().map(|f| std::borrow::Cow::Borrowed(*f)).collect();
             if let Err(e) = cx.text_system().add_fonts(fonts) {
                 tracing::warn!("bundled fonts not loaded: {e:#}");
@@ -181,13 +191,15 @@ fn main() {
                         let _ = w.update(cx, |this, window, cx| {
                             this.drain_documents(window, cx);
                             this.close_mods_now(deadline, window, cx);
-                            place::save(window, cx);
+                            this.save_window_place(window, cx);
                         });
                     }
                 }
                 mods::finish_shared();
                 telemetry::quit();
-                let _ = update::apply();
+                if !restart::pending() {
+                    let _ = update::apply();
+                }
                 async {}
             })
             .detach();
@@ -213,28 +225,52 @@ fn main() {
 
 /// The main window, on a connected core.
 pub fn open_main(core: std::sync::Arc<hc::Core>, requests: async_channel::Receiver<mods::Request>, cx: &mut App) {
-            let (window_bounds, display_id) = place::initial(cx);
-            let options = WindowOptions {
-                window_bounds: Some(window_bounds),
-                display_id,
-                // macOS: always see-through, so a layout can draw its own title bar
-                // live; the app drags the window (window/titlebar.rs).
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Herdr".into()),
-                    // Windows: hidden for good (it can't change live); the app draws it.
-                    appears_transparent: cfg!(any(target_os = "macos", windows)),
-                    traffic_light_position: cfg!(target_os = "macos").then(|| point(px(12.0), px(7.0))),
-                }),
-                app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                // Linux: open with the title bar the shipped layouts draw. Turning the
-                // system's off on the first render, while KWin maps the window, shrinks
-                // it to 20x20; turning it on later (a "system" layout) is fine.
-                window_decorations: Some(WindowDecorations::Client),
-                // Herdr Dev and other side-by-side builds get their own dock icon.
-                app_id: Some(std::env::var("HERDR_APP_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr-app".into())),
-                ..Default::default()
-            };
-            cx.open_window(options, |window, cx| cx.new(|cx| window::AppWindow::new(core, requests, window, cx)))
-                .expect("cannot open the Herdr window");
-            cx.activate(true);
+    let config = settings::load_person().unwrap_or_default().quick_terminal;
+    let mut error = None;
+    if config.enabled {
+        let panel = cx.try_open_window(main_window_options(true, cx), |window, cx| {
+            let terminal = quick_terminal::QuickTerminal::start(window, &config).map_err(anyhow::Error::msg)?;
+            Ok(cx.new(|cx| window::AppWindow::new(core.clone(), requests.clone(), terminal, window, cx)))
+        });
+        match panel {
+            Ok(_) => return,
+            Err(cause) => error = Some(cause.to_string()),
+        }
+    }
+
+    let terminal = quick_terminal::QuickTerminal::inactive(&config, error);
+    cx.open_window(main_window_options(false, cx), |window, cx| {
+        cx.new(|cx| window::AppWindow::new(core, requests, terminal, window, cx))
+    }).expect("cannot open the Herdr window");
+    cx.activate(true);
+}
+
+fn main_window_options(quick: bool, cx: &App) -> WindowOptions {
+    let (window_bounds, display_id) = place::initial(cx);
+    WindowOptions {
+        window_bounds: Some(if quick {
+            WindowBounds::Windowed(Bounds::centered(None, size(px(1000.), px(600.)), cx))
+        } else { window_bounds }),
+        display_id,
+        kind: if quick && cfg!(target_os = "macos") { WindowKind::PopUp } else { WindowKind::Normal },
+        show: !quick,
+        focus: !quick,
+        is_minimizable: !quick,
+        // macOS: always see-through, so a layout can draw its own title bar
+        // live; the app drags the window (window/titlebar.rs).
+        titlebar: Some(TitlebarOptions {
+            title: Some("Herdr".into()),
+            // Windows: hidden for good (it can't change live); the app draws it.
+            appears_transparent: cfg!(any(target_os = "macos", windows)),
+            traffic_light_position: cfg!(target_os = "macos").then(|| point(px(12.0), px(7.0))),
+        }),
+        app_owns_titlebar_drag: cfg!(target_os = "macos"),
+        // Linux: open with the title bar the shipped layouts draw. Turning the
+        // system's off on the first render, while KWin maps the window, shrinks
+        // it to 20x20; turning it on later (a "system" layout) is fine.
+        window_decorations: Some(WindowDecorations::Client),
+        // Herdr Dev and other side-by-side builds get their own dock icon.
+        app_id: Some(std::env::var("HERDR_APP_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr-app".into())),
+        ..Default::default()
+    }
 }

@@ -32,6 +32,7 @@ mod open_type;
 mod text_system;
 
 mod platform;
+mod quick_resize;
 mod window;
 mod window_appearance;
 
@@ -57,7 +58,7 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
-pub use events::{OptionAsAlt, option_as_alt, set_option_as_alt};
+pub use events::{OptionAsAlt, option_as_alt, set_option_as_alt, shortcut_key_label};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

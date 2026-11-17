@@ -81,6 +81,7 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const QUICK_RESIZE_IVAR: &str = "herdrQuickResize";
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
@@ -429,7 +430,18 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
     unsafe {
         let mut decl = ClassDecl::new(name, superclass).unwrap();
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+        decl.add_ivar::<*mut c_void>(QUICK_RESIZE_IVAR);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
+
+        // HERDR: opt-in anchored resizing belongs to quick-terminal panels only.
+        if ptr::eq(superclass, class!(NSPanel)) {
+            decl.add_method(sel!(herdrSetQuickResizeBounds:), set_quick_resize_bounds as extern "C" fn(&mut Object, Sel, NSRect));
+            decl.add_method(sel!(herdrClearQuickResize), clear_quick_resize as extern "C" fn(&mut Object, Sel));
+            decl.add_method(sel!(herdrQuickResizeSamples), quick_resize_samples as extern "C" fn(&Object, Sel) -> u64);
+            decl.add_method(sel!(windowWillStartLiveResize:), quick_resize_started as extern "C" fn(&Object, Sel, id));
+            decl.add_method(sel!(windowDidEndLiveResize:), quick_resize_ended as extern "C" fn(&Object, Sel, id));
+            decl.add_method(sel!(setFrame:display:), set_quick_panel_frame as extern "C" fn(&Object, Sel, NSRect, BOOL));
+        }
 
         decl.add_method(
             sel!(canBecomeMainWindow),
@@ -1319,12 +1331,18 @@ impl MacWindow {
     pub fn active_window() -> Option<AnyWindowHandle> {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
-            let main_window: id = msg_send![app, mainWindow];
+            let key_window: id = msg_send![app, keyWindow];
+            let main_window: id = if !key_window.is_null() && is_gpui_window(key_window) {
+                key_window
+            } else {
+                msg_send![app, mainWindow]
+            };
             if main_window.is_null() {
                 return None;
             }
 
-            if msg_send![main_window, isKindOfClass: WINDOW_CLASS] {
+            // HERDR: a quick terminal is an NSPanel and participates in window actions.
+            if is_gpui_window(main_window) {
                 let handle = get_window_state(&*main_window).lock().handle;
                 Some(handle)
             } else {
@@ -1342,7 +1360,7 @@ impl MacWindow {
             let mut window_handles = Vec::new();
             for i in 0..count {
                 let window: id = msg_send![windows, objectAtIndex:i];
-                if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                if is_gpui_window(window) {
                     let handle = get_window_state(&*window).lock().handle;
                     window_handles.push(handle);
                 }
@@ -2509,8 +2527,72 @@ extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
 
 extern "C" fn dealloc_window(this: &Object, _: Sel) {
     unsafe {
+        let quick: *mut c_void = *this.get_ivar(QUICK_RESIZE_IVAR);
+        if !quick.is_null() {
+            drop(Box::from_raw(quick.cast::<crate::quick_resize::QuickResize>()));
+        }
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSWindow)), dealloc];
+    }
+}
+
+fn quick_rect(frame: NSRect) -> [f64; 4] {
+    [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]
+}
+
+extern "C" fn set_quick_resize_bounds(this: &mut Object, _: Sel, bounds: NSRect) {
+    clear_quick_resize(this, sel!(herdrClearQuickResize));
+    let resize = Box::new(crate::quick_resize::QuickResize::new(quick_rect(bounds)));
+    unsafe { this.set_ivar(QUICK_RESIZE_IVAR, Box::into_raw(resize).cast::<c_void>()); }
+}
+
+extern "C" fn clear_quick_resize(this: &mut Object, _: Sel) {
+    unsafe {
+        let quick: *mut c_void = *this.get_ivar(QUICK_RESIZE_IVAR);
+        this.set_ivar(QUICK_RESIZE_IVAR, ptr::null_mut::<c_void>());
+        if !quick.is_null() {
+            drop(Box::from_raw(quick.cast::<crate::quick_resize::QuickResize>()));
+        }
+    }
+}
+
+extern "C" fn quick_resize_samples(this: &Object, _: Sel) -> u64 {
+    unsafe {
+        let quick: *mut c_void = *this.get_ivar(QUICK_RESIZE_IVAR);
+        if quick.is_null() { 0 } else { (*quick.cast::<crate::quick_resize::QuickResize>()).samples }
+    }
+}
+
+extern "C" fn quick_resize_started(this: &Object, _: Sel, _: id) {
+    unsafe {
+        let quick: *mut c_void = *this.get_ivar(QUICK_RESIZE_IVAR);
+        if quick.is_null() { return; }
+        let frame: NSRect = msg_send![this, frame];
+        let screen: id = msg_send![this, screen];
+        let bounds: NSRect = if screen.is_null() { frame } else { msg_send![screen, visibleFrame] };
+        let pointer = NSEvent::mouseLocation(nil);
+        (*quick.cast::<crate::quick_resize::QuickResize>()).begin(quick_rect(frame), [pointer.x, pointer.y], quick_rect(bounds));
+    }
+}
+
+extern "C" fn quick_resize_ended(this: &Object, _: Sel, _: id) {
+    unsafe {
+        let quick: *mut c_void = *this.get_ivar(QUICK_RESIZE_IVAR);
+        if !quick.is_null() { (*quick.cast::<crate::quick_resize::QuickResize>()).end(); }
+    }
+}
+
+extern "C" fn set_quick_panel_frame(this: &Object, _: Sel, frame: NSRect, display: BOOL) {
+    unsafe {
+        let quick: *mut c_void = *this.get_ivar(QUICK_RESIZE_IVAR);
+        let frame = if quick.is_null() { frame } else {
+            let pointer = NSEvent::mouseLocation(nil);
+            let minimum: NSSize = msg_send![this, minSize];
+            let [x, y, width, height] = (*quick.cast::<crate::quick_resize::QuickResize>())
+                .constrain(quick_rect(frame), [pointer.x, pointer.y], [minimum.width, minimum.height]);
+            NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        };
+        let _: () = msg_send![super(this, class!(NSPanel)), setFrame: frame display: display];
     }
 }
 

@@ -94,12 +94,19 @@ impl AppWindow {
             "maximized": window.is_maximized(),
             "fullscreen": window.is_fullscreen(),
             "active": self.window_active,
+            "restart_required": self.quick_terminal.restart_required(&self.person.quick_terminal),
+            "quick_terminal_config": self.person.quick_terminal,
+            "quick_terminal_error": self.quick_terminal.error(),
+            "quick_terminal_permission": self.quick_terminal_permission.unwrap_or(crate::quick_terminal::Permission {
+                required: false, granted: true, restart_required: false, recheck_available: false,
+            }),
         })
     }
 
     /// Makes a node move the window when dragged and maximize it on a double-click.
     pub(super) fn window_drag(&self, el: Div, cx: &mut Context<Self>) -> Div {
         el.on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, _| {
+            if this.quick_terminal.enabled() { return; }
             if ev.click_count == 2 {
                 this.drag_from = None;
                 #[cfg(target_os = "macos")]
@@ -152,7 +159,7 @@ impl AppWindow {
             if self.titlebar() == Titlebar::Layout || window.is_fullscreen() {
                 return tree;
             }
-            let strip = win::strip(window.is_maximized(), cx);
+            let strip = win::strip(window.is_maximized(), self.quick_terminal.enabled(), cx);
             div().size_full().flex().flex_col().child(strip).child(div().flex_1().min_h_0().flex().child(tree)).into_any_element()
         }
         #[cfg(not(any(target_os = "macos", windows)))]
@@ -206,11 +213,21 @@ impl AppWindow {
     }
 
     pub(super) fn window_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_terminal.enabled() && name == "window.maximize" {
+            self.reply = Some(json!({ "error": "Resize the quick terminal by dragging its edges, or change its initial width and height in Settings" }));
+            return;
+        }
+        if self.quick_terminal.enabled() && matches!(name, "window.close" | "window.minimize") {
+            if let Err(error) = self.quick_terminal.run("quick_terminal.hide") {
+                self.reply = Some(json!({ "error": error }));
+            }
+            return;
+        }
         match name {
             "window.close" => {
                 self.drain_documents(window, cx);
                 self.close_mods_now(std::time::Instant::now() + Duration::from_millis(250), window, cx);
-                crate::place::save(window, cx);
+                self.save_window_place(window, cx);
                 window.remove_window();
             }
             "window.minimize" => window.minimize_window(),
@@ -259,7 +276,7 @@ mod win {
 
     /// The `system` title bar: a strip in the theme, Windows' buttons on the
     /// right. Windows itself handles the areas (drag, snap layouts, double-click).
-    pub(super) fn strip(maximized: bool, _cx: &mut Context<AppWindow>) -> AnyElement {
+    pub(super) fn strip(maximized: bool, quick: bool, cx: &mut Context<AppWindow>) -> AnyElement {
         let button = |id: &'static str, icon: &'static [u8], area: WindowControlArea, hover: Hsla, hover_text: Hsla| {
             div()
                 .id(id)
@@ -280,9 +297,16 @@ mod win {
             .h(settings::z(WIN_STRIP))
             .w_full()
             .flex()
-            .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
-            .child(button("win-min", include_bytes!("../../defaults/mods/tabs/win-min.svg"), WindowControlArea::Min, c("raised"), c("foreground")))
-            .child(button("win-max", if maximized { include_bytes!("../../defaults/mods/tabs/win-restore.svg") } else { include_bytes!("../../defaults/mods/tabs/win-max.svg") }, WindowControlArea::Max, c("raised"), c("foreground")))
+            .child(div().flex_1().h_full().when(!quick, |el| el.window_control_area(WindowControlArea::Drag)))
+            .when(quick, |el| el.child(
+                div().id("win-quick-hide").w(settings::z(WIN_BUTTON)).h_full().flex().items_center().justify_center()
+                    .hover(|s| s.bg(c("raised")))
+                    .on_click(cx.listener(|this, _, window, cx| this.run("quick_terminal.hide", Value::Null, window, cx)))
+                    .child(svg().data(include_bytes!("../../defaults/mods/tabs/win-min.svg").as_slice()).size(settings::z(16.0)).text_color(c("dim")))
+            ))
+            .when(!quick, |el| el
+                .child(button("win-min", include_bytes!("../../defaults/mods/tabs/win-min.svg"), WindowControlArea::Min, c("raised"), c("foreground")))
+                .child(button("win-max", if maximized { include_bytes!("../../defaults/mods/tabs/win-restore.svg") } else { include_bytes!("../../defaults/mods/tabs/win-max.svg") }, WindowControlArea::Max, c("raised"), c("foreground"))))
             .child(button("win-close", include_bytes!("../../defaults/mods/tabs/win-close.svg"), WindowControlArea::Close, red, gpui::white()))
             .into_any_element()
     }

@@ -221,6 +221,17 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     for name in ["feedbackPasteImage", "feedbackClearImages", "feedbackAttachImages"] {
         module = module.function(name, |_| Ok(HostValue::Null));
     }
+    module = module.function("quickTerminalShortcut", |a| {
+        let value = if a.get(0).map(from_host) == Some(json!("validate")) {
+            match a.string(1)? {
+                shortcut @ ("double-cmd" | "double-left-alt") => json!({ "state": "valid", "shortcut": shortcut }),
+                _ => json!({ "state": "error", "error": "Unknown fixture shortcut" }),
+            }
+        } else {
+            json!({ "state": "idle" })
+        };
+        Ok(to_host(&value))
+    });
     module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("knownAgents", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
@@ -884,7 +895,7 @@ fn settings_sections_and_updates(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let start = Instant::now();
     let staged = Staged::new();
-    for section in ["look", "alerts", "privacy", "updates"] {
+    for section in ["look", "quick-terminal", "alerts", "privacy", "updates"] {
         let mut p = props();
         p["section"] = json!(section);
         describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), None).unwrap();
@@ -924,6 +935,68 @@ fn settings_sections_and_updates(cx: &mut TestAppContext) {
         assert!(tree.contains(if checking { "Checking" } else if succeeded { "Up to date" } else { "Check your connection" }), "check status missing: {tree}");
     }
     eprintln!("27 settings cases, each twice: {:?}", start.elapsed());
+}
+
+#[gpui::test]
+fn shortcut_field_renders_inline_capture(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for platform in ["macos", "windows", "linux"] {
+        for setup in [
+            None,
+            Some("this.shortcutEdit = { state: 'recording', phase: 'idle' };"),
+            Some("this.shortcutEdit = { state: 'recording', phase: 'modifier-down', preview: 'right-cmd' };"),
+            Some("this.shortcutEdit = { state: 'recording', phase: 'awaiting-second-tap', preview: 'right-cmd' };"),
+            Some("this.shortcutEdit = { state: 'recorded', shortcut: 'ctrl-alt-space', ready: false, phase: 'releasing' };"),
+            Some("this.shortcutNotice = 'Saved. Restart Herdr to apply.';"),
+            Some("this.shortcutEdit = { state: 'error', error: 'Shortcut is unavailable' };"),
+        ] {
+            let mut p = props();
+            p["section"] = json!("quick-terminal");
+            let mut values = fixture(true, p, updates("current", "current"));
+            values.insert("window".into(), json!({ "platform": platform }));
+            let tree = describe_with_values(cx, &staged, "frame/settings", values, setup).unwrap();
+            assert!(tree.contains("st-shortcut-field"), "{platform}: {tree}");
+            for removed in ["st-quick-cmd", "st-quick-chord", "st-shortcut-use", "st-shortcut-cancel", "st-shortcut-double"] {
+                assert!(!tree.contains(removed), "{platform}: extra shortcut control {removed}: {tree}");
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn quick_terminal_permission_notice_tracks_access(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for (platform, shortcut, enabled, required, granted, restart, blocked) in [
+        ("macos", "double-left-alt", true, true, false, false, true),
+        ("macos", "double-left-alt", true, true, true, true, false),
+        ("macos", "double-left-alt", true, true, true, false, false),
+        ("macos", "double-cmd", false, false, false, false, true),
+        ("macos", "ctrl-alt-space", true, true, false, false, false),
+        ("macos", "double-invalid", false, false, false, false, false),
+        ("windows", "ctrl-alt-space", true, false, true, false, false),
+        ("linux", "ctrl-alt-space", true, false, true, false, false),
+    ] {
+        let mut p = props();
+        p["section"] = json!("quick-terminal");
+        let mut values = fixture(true, p, updates("current", "current"));
+        values.insert("window".into(), json!({
+            "platform": platform,
+            "restart_required": false,
+            "quick_terminal_config": { "enabled": enabled, "shortcut": shortcut },
+            "quick_terminal_permission": { "required": required, "granted": granted, "restart_required": restart },
+        }));
+        let tree = describe_with_values(cx, &staged, "frame/settings", values, None).unwrap();
+        let switch = tree.lines().find(|line| line.contains("st-quick-enable")).unwrap();
+        assert!(switch.contains(":role[Str(\"switch\")]") && switch.contains(":accessibility_label[Str(\"Enable quick terminal\")]"), "{switch}");
+        assert!(switch.contains(&format!(":checked[Bool({})]", enabled && !blocked)), "{switch}");
+        assert!(switch.contains(&format!(":disabled[Bool({blocked})]")), "{switch}");
+        assert_eq!(tree.contains("st-quick-permissions"), blocked, "{platform}: {tree}");
+        assert_eq!(tree.contains("st-quick-disable"), blocked && enabled, "{platform}: {tree}");
+        assert_eq!(tree.contains("st-quick-restart"), restart, "{platform}: {tree}");
+        assert_eq!(tree.contains("Permission granted"), restart, "{platform}: {tree}");
+    }
 }
 
 #[gpui::test]

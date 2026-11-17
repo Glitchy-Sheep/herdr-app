@@ -586,6 +586,12 @@ Restart into the update Herdr downloaded (your terminals keep running).
 
 No arguments.
 
+## `app.restart`
+
+Restart Herdr to apply saved settings; tabs and terminals keep running.
+
+No arguments.
+
 ## `app.quit`
 
 Quit (macOS).
@@ -625,6 +631,30 @@ No arguments.
 ## `window.maximize`
 
 Maximize the window, or back.
+
+No arguments.
+
+## `quick_terminal.toggle`
+
+Show or hide the enabled quick terminal on the current screen.
+
+No arguments.
+
+## `quick_terminal.show`
+
+Show the enabled quick terminal.
+
+No arguments.
+
+## `quick_terminal.hide`
+
+Hide the quick terminal and return to the previous app.
+
+No arguments.
+
+## `quick_terminal.permissions`
+
+Open macOS Accessibility settings to allow the global double-modifier shortcut.
 
 No arguments.
 

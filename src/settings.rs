@@ -367,6 +367,7 @@ fn resolve(p: &Palette, overrides: &BTreeMap<String, String>) -> Theme {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Person {
+    pub quick_terminal: crate::quick_terminal::Config,
     /// How big the whole app is drawn (1 = as designed). The zoom keys change it.
     pub zoom: f32,
     pub sounds: Sounds,
@@ -457,6 +458,7 @@ fn is_true(b: &bool) -> bool {
 impl Default for Person {
     fn default() -> Self {
         Person {
+            quick_terminal: Default::default(),
             zoom: 1.0,
             sounds: Sounds::default(),
             core: None,
@@ -707,6 +709,7 @@ pub fn load_person() -> Result<Person, String> {
     }
     let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let person: Person = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    person.quick_terminal.validate()?;
     if !(ZOOM_MIN..=ZOOM_MAX).contains(&person.zoom) {
         return Err(format!("zoom {} is outside {ZOOM_MIN}..{ZOOM_MAX}", person.zoom));
     }

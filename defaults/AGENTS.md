@@ -77,13 +77,14 @@ first frame or during GPU recovery it reports an error instead of a PNG.
 |---|---|---|
 | `layouts/<name>.json` | the window and its whole look: blocks, theme, fonts, backgrounds, pane frames; one file per layout (`main`, `terminals`, `win98`, any you add) | live |
 | `keys.json` | what every key does | live |
-| `settings.json` | the person: zoom, sounds, fonts for every layout, worktree directory | live |
+| `settings.json` | the person: zoom, sounds, fonts for every layout, worktree directory, quick terminal | live; `quick_terminal` needs a restart except `auto_hide` |
 | `mods/<name>/` | panels: small JavaScript programs | live (hot reload) |
 | `programs.json` | how programs show (name, icon, tile), on top of the built-in table | live |
 | `icons/` | the shipped program icons | written by Herdr (put your own elsewhere) |
 | `frame/` | the app's own screens (welcome, ...) | rewritten by Herdr on every start: don't edit, it won't stick |
 | `view.json` | this screen's selected space/tab/pane, zoom, settled tabs, recent spaces and seen attention | written by Herdr |
 | `shared.json`, `data/`, `seen.json`, `installed.json`, `window.json`, `windows.json` | mod state, bookkeeping, where the window was (size, maximized), mods' windows (spots, kept ones) | written by Herdr |
+| `quick-terminal-window.json` | quick terminal's manual size, tied to the operating system and initial width/height settings | written by Herdr after a resize; restored on summon and restart |
 
 Shared state is saved atomically in the background, with the latest change winning.
 If `shared.json` is invalid, Herdr logs a warning and keeps it as
@@ -507,6 +508,8 @@ the build doesn't do.
 
 ## Keys: `keys.json`
 
+The `global` section applies throughout Herdr, while its window has focus. The system-wide quick-terminal shortcut is configured separately in `settings.json` under `quick_terminal.shortcut`.
+
 On upgrade, an untouched keys file from an earlier release gets the current
 shortcuts. Any edit, even whitespace, keeps the entire file as yours; new default
 shortcuts must then be added by hand.
@@ -677,7 +680,7 @@ The main ones:
   `app.check_updates` (only a successful check reports Up to date; a failed check clears the checked time and can be retried), `app.update_core` (a newer herdr-core of this generation, terminals kept;
   never one a package manager owns), `app.welcome`, `app.whats_new`, `app.feedback {message?, from?}` (from `"person"` or `"agent"`; opens a review window, where the person can paste up to 3 screenshots; never sends until the person clicks Send), `app.reset`,
   `app.theme {name}`, `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`,
-  `app.update` (restart into a downloaded update).
+  `app.update` (restart into a downloaded update), `app.restart` (reopen Herdr to apply saved settings; tabs and terminals keep running).
   Add machine lists all named ssh-config hosts in a scrollable list. Machines
   that need a password, a new host key or herdr-core installed show what to run
   in your own terminal; the picker updates once it is added. Other machines are
@@ -693,6 +696,8 @@ The main ones:
   explicitly forget the old identity and pair again with the same name and target.
   Other unreachable machines don't offer this.
 - Window: `window.minimize`, `window.maximize` (or back), `window.close`.
+- Quick terminal: `quick_terminal.toggle`, `quick_terminal.show`, `quick_terminal.hide` take no arguments. They require `quick_terminal.enabled` at startup, work through `herdr-app do` while the window is hidden, and leave terminals running. `herdr-app status` includes `quick_terminal.enabled`, `visible`, the effective `auto_hide`, `error` and `warning`. On macOS, `quick_terminal.native` also reports actual visibility/focus, pending visibility and `shortcut_activations`; that counter increases for recognized physical shortcuts, not CLI commands.
+- `quick_terminal.permissions` opens macOS Accessibility settings and requests permission for the global double-modifier shortcut. It takes no arguments, works before enabling quick-terminal mode, and never grants permission itself. Opening the permission page hides the quick-terminal panel. When macOS confirms access while System Settings is in front, Herdr returns to Quick terminal settings and offers a restart if needed. If Herdr.app is allowed in System Settings but access is still unconfirmed, click Herdr in the Dock and choose Restart and recheck. Run it only when the person asks to open the permission page.
 - macOS: `app.quit`, `app.hide`, `app.hide_others`, `app.show_all`.
 
 When the user runs a command without a required name (a key, a click), Herdr
@@ -713,6 +718,30 @@ herdr-app commands    # every command and its arguments
 "terminal" }`, `{ "pane", "terminal" }`) or `{ "error": "..." }` and exits 1.
 
 ## The person: `settings.json`
+
+`quick_terminal` makes the app's window available from other applications with a system-wide shortcut. It is off by default. Settings > Quick terminal writes the same object. `auto_hide` applies immediately; the other quick-terminal changes apply after restarting Herdr. The accent-colored Restart Herdr button appears only when saved mode, shortcut or initial size settings differ from those loaded at startup. Reverting those changes or restarting hides it; changing only `auto_hide` does not show it. The live `window().restart_required` and top-level `status.restart_required` report the same condition. The button reopens the app without stopping its terminals and is unavailable while a setting is being saved or a shortcut is being recorded. Set `enabled` to `false` and restart to return to an ordinary window. Never restart the person's app just to apply a setting unless they asked for it.
+
+Click the Global shortcut field to record a chord or, on macOS, double-tap the same modifier key. The field guides each tap and saves automatically after all keys are released. Escape, focus loss and closing Settings cancel incomplete input without saving. Double taps distinguish left and right: `double-left-cmd`, `double-right-cmd`, and the same forms for `alt`, `ctrl` and `shift`. Legacy `double-cmd` accepts either side, with both taps on the same physical key. Ordinary chords accept either modifier side. Standalone function keys support F1-F20 on macOS and F1-F24 on Windows/X11, except reserved Windows F12; other keys require Ctrl, Alt or Cmd/Super.
+
+On macOS, Herdr detects missing Accessibility / Device Control and Data Access permission and shows a notification linking to Quick terminal settings. With a double modifier selected, the enable switch stays off and disabled until access is granted. Herdr preserves the saved preference. The user can open System Settings, record an ordinary shortcut, or turn off a previously enabled mode. Settings uses the last valid `window().quick_terminal_config` and displays `window().quick_terminal_error` when native setup fails. The live `window().quick_terminal_permission` and `status.quick_terminal.permission` expose `{required, granted, restart_required, recheck_available}`. An explicit permission visit can offer a recheck even before the mode is enabled. After permission is granted, the notice updates automatically and offers Restart Herdr if the global monitor needs it. This permission restart is separate from saved-settings `restart_required`. The app never grants itself access or opens the system prompt without a user action.
+
+The Settings-only recorder uses `quickTerminalShortcut(action?, shortcut?)` from `herdr`: no action reads its status; `start` begins recording, `cancel` cancels it, and `validate` checks a candidate shortcut. It returns `{state, shortcut?, key_label?, preview?, ready?, phase?, error?}`. On macOS, validation can include the current keyboard layout's printable label for a physical key. The API never writes settings; the field validates and saves a shortcut when `state` is `recorded` and `ready` is `true`. `ready` remains false while any captured key or modifier is held. See `herdr.d.ts` for the state and phase values.
+
+```json
+{
+  "quick_terminal": {
+    "enabled": true,
+    "shortcut": "ctrl-alt-backquote",
+    "width": 1.0,
+    "height": 0.6,
+    "auto_hide": true
+  }
+}
+```
+
+The default `shortcut` is `double-cmd` on macOS and `ctrl-alt-backquote` on Windows and X11. Double-modifier gestures require Herdr permission under Accessibility / Device Control and Data Access in macOS System Settings > Privacy & Security; ordinary shortcuts do not. Use a shortcut that another application does not already claim. `width` and `height` set the initial fractions of the screen's usable area, each from 0.1 to 1; their defaults are 1 and 0.6. Drag the panel's edges or corners to resize it. On macOS and Windows, it stays horizontally centered with equal side margins and its top edge pinned to the screen's usable area throughout the drag. On X11, the window manager controls the drag; Herdr restores centered positioning and top alignment immediately after mouse release. This manual size survives hiding, showing and app restarts; changing either initial percentage and restarting resets it. On a smaller display the panel fits the usable area without replacing the preferred size for a larger display. Herdr writes this state to `quick-terminal-window.json`, separately from ordinary-window placement. `auto_hide` defaults to true and hides the window when focus leaves. It applies immediately; set it to false to keep Herdr visible above other windows while working in another app. The shortcut still shows and hides the panel. The window appears on the pointer's screen; showing and hiding do not alter its spaces or tabs. In quick mode, window close and minimize commands hide it. Quit still exits Herdr.
+
+macOS uses a native panel that can appear above full-screen applications. Windows and X11 use their native window and shortcut mechanisms; X11 placement and stacking remain subject to the window manager. Native Wayland does not support this mode: enabling it reports an error instead of claiming that a global shortcut is registered. Keep the ordinary window on Wayland. Check `herdr-app status` after startup for shortcut conflicts or unsupported-platform errors.
 
 What's about the user, never a look:
 

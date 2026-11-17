@@ -4,6 +4,7 @@ use gpui_shell::action::ShellAction;
 actions!(herdr, [Quit, Hide, HideOthers, ShowAll, Settings]);
 
 pub fn init(cx: &mut App) {
+    cx.on_keyboard_layout_change(|_| crate::quick_terminal::keyboard_layout_changed()).detach();
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());

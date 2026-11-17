@@ -30,7 +30,7 @@ async function change(raw: string | null, edit: (q: Record<string, any>) => void
   const view = new Settings();
   let done: () => void;
   const finished = new Promise<void>((resolve) => (done = resolve));
-  view.change(edit, { spawn: (f: (cx: any) => Promise<void>) => f({ notify: () => done() }) });
+  view.change(edit, { notify() {}, spawn: (f: (cx: any) => Promise<void>) => f({ notify: () => done() }) });
   await finished;
   return { view, toasts: disk.toasts };
 }

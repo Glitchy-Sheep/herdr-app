@@ -601,6 +601,11 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
     translate_key(code, modifiers, true)
 }
 
+/// HERDR: the key cap of a physical shortcut in the current input layout.
+pub fn shortcut_key_label(code: CGKeyCode) -> String {
+    chars_for_modified_key(code, NO_MOD)
+}
+
 fn translate_key(code: CGKeyCode, modifiers: u32, resolve_dead_keys: bool) -> String {
     // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
     // shifted >> 8 for UCKeyTranslate
