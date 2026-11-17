@@ -112,10 +112,19 @@ jobs:
           openbox >"$out/openbox.log" 2>&1 &
           for _ in {1..50}; do xprop -root _NET_SUPPORTED | grep -q _NET_WM_STATE_ABOVE && break; sleep .1; done
           start
-          sb do quick_terminal.hide | jq -e '.ok and (.visible == false)'
-          sb status | jq -e '.quick_terminal | .enabled and (.visible == false) and (.error == null)'
-          sb do quick_terminal.toggle | jq -e '.ok and .visible'
-          sb status | jq -e '.quick_terminal | .enabled and .visible and (.error == null)'
+          check_command() {
+            local command=$1 visible=$2 status="$out/openbox-$1-status.json"
+            sb do "quick_terminal.$command" | tee "$out/openbox-$command-reply.json" | jq -e '.ok'
+            for _ in {1..50}; do
+              sb status >"$status"
+              if jq -e --argjson want "$visible" '.quick_terminal | .enabled and (.visible == $want) and (.error == null)' "$status" >/dev/null; then return; fi
+              sleep .1
+            done
+            cat "$status" >&2
+            return 1
+          }
+          check_command hide false
+          check_command toggle true
           settings_shot
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
