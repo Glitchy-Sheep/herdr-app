@@ -277,6 +277,19 @@ impl DoubleTap {
         self.blocked = self.down;
     }
 
+    pub fn flags_with_key_state(
+        &mut self,
+        key: u16,
+        flags: u64,
+        at: f64,
+        mut still_held: impl FnMut(u16) -> bool,
+    ) -> bool {
+        if !self.down && flags & self.modifier.flag() != 0 {
+            self.held_keys.retain(|key| still_held(*key));
+        }
+        self.flags(key, flags, at)
+    }
+
     pub fn flags(&mut self, key: u16, flags: u64, at: f64) -> bool {
         let was_down = self.down;
         self.down = flags & self.modifier.flag() != 0;
@@ -776,6 +789,29 @@ mod tests {
         d.ordinary_key(12, false);
         assert!(!tap(&mut d, 58, 3.0));
         assert!(tap(&mut d, 58, 3.1));
+    }
+
+    #[test]
+    fn missing_key_ups_recover_without_counting_an_overlapping_tap() {
+        let mut d = detector("double-left-alt");
+        d.ordinary_key(0, true);
+        d.ordinary_key(12, true);
+        let alt = 1 << 19;
+        // A was released without a key-up. Q stays down across two taps.
+        for at in [1.0, 1.15] {
+            assert!(!d.flags_with_key_state(58, alt, at, |key| key == 12));
+            assert!(!d.flags(58, 0, at + 0.05));
+        }
+        assert!(!d.flags_with_key_state(58, alt, 1.3, |key| key == 12));
+        // Q is released during this tap. Both key-ups are now missing.
+        assert!(!d.flags(58, 0, 1.35));
+        assert!(!d.flags_with_key_state(58, alt, 1.45, |key| {
+            assert_eq!(key, 12);
+            false
+        }));
+        assert!(!d.flags(58, 0, 1.5));
+        assert!(!d.flags_with_key_state(58, alt, 1.6, |_| panic!("no tracked keys remain")));
+        assert!(d.flags(58, 0, 1.65));
     }
 
     #[test]

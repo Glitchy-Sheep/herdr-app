@@ -37,6 +37,27 @@ const HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"HdrQ");
 const HOTKEY_PRESSED: u32 = 5;
 const HOTKEY_RELEASED: u32 = 6;
 const HOTKEY_EXCLUSIVE: u32 = 1;
+const COMBINED_SESSION_STATE: i32 = 0;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event: u32) -> f64;
+}
+
+fn key_held_at(key: u16, event_time: f64) -> bool {
+    unsafe {
+        if CGEventSourceKeyState(COMBINED_SESSION_STATE, key) {
+            return true;
+        }
+        // AppKit can queue modifier events before Quartz reports a newer release.
+        let since_release =
+            CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, KEY_UP as u32);
+        let process: id = msg_send![class!(NSProcessInfo), processInfo];
+        let now: f64 = msg_send![process, systemUptime];
+        now - since_release >= event_time
+    }
+}
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -382,7 +403,9 @@ impl Native {
                 let flags: u64 = msg_send![event, modifierFlags];
                 let key: u16 = msg_send![event, keyCode];
                 let at: f64 = msg_send![event, timestamp];
-                if detector.flags(key, flags, at) && (!global || accessibility_trusted()) {
+                if detector.flags_with_key_state(key, flags, at, |held| key_held_at(held, at))
+                    && (!global || accessibility_trusted())
+                {
                     state.shortcut_pressed();
                 }
             }
