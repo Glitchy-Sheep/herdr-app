@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: quick-terminal-linux-sandbox-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   screenshot:
     if: github.repository == 'Glitchy-Sheep/herdr-app'
@@ -56,10 +60,10 @@ jobs:
             scripts/sandbox do app.settings '{"section":"quick-terminal"}'
             for _ in {1..25}; do
               scripts/sandbox status >"$out/$HERDR_APP_SANDBOX-status.json"
-              if jq -e 'any(.overlays[]; . == "frame/settings")' "$out/$HERDR_APP_SANDBOX-status.json"; then break; fi
+              if jq -e 'any(.overlays[]; . == "frame-settings")' "$out/$HERDR_APP_SANDBOX-status.json"; then break; fi
               sleep .2
             done
-            jq -e 'any(.overlays[]; . == "frame/settings")' "$out/$HERDR_APP_SANDBOX-status.json"
+            jq -e 'any(.overlays[]; . == "frame-settings")' "$out/$HERDR_APP_SANDBOX-status.json"
             sleep 1
             timeout 25 scripts/sandbox shot "$out/$HERDR_APP_SANDBOX.png"
             tesseract "$out/$HERDR_APP_SANDBOX.png" "$out/$HERDR_APP_SANDBOX" 2>/dev/null
