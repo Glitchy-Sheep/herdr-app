@@ -1,0 +1,95 @@
+name: Quick terminal Linux UI
+on:
+  push:
+    branches: [test/quick-terminal-linux-ui]
+
+permissions:
+  contents: read
+
+jobs:
+  screenshot:
+    if: github.repository == 'Glitchy-Sheep/herdr-app'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+      - name: Install dependencies and the Herdr core
+        run: |
+          scripts/ci-apt pkg-config clang libclang-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev mesa-vulkan-drivers libfontconfig-dev libfreetype-dev weston xwayland imagemagick xvfb openbox x11-utils tesseract-ocr tesseract-ocr-eng
+          install -d "$HOME/.local/bin" "$HOME/.cargo"
+          if ! command -v magick >/dev/null; then
+            ln -s "$(command -v convert)" "$HOME/.local/bin/magick"
+          fi
+          curl --retry 4 -fsSL https://releases.herdr.dev/core/install.sh -o "$RUNNER_TEMP/install-core.sh"
+          HC_INSTALL_DIR="$HOME/.local/bin" sh "$RUNNER_TEMP/install-core.sh"
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          printf '\n[profile.dev.package."*"]\nopt-level = 0\n' >>"$HOME/.cargo/config.toml"
+          cargo build --locked
+      - name: Run the full app on the sandbox display and a private X11 desktop
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/herdr-ui"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/wayland-runtime"
+          install -d -m 700 "$XDG_RUNTIME_DIR" "$out"
+          export HERDR_APP_SANDBOX=weston-ui
+          root=/var/tmp/herdr-app-$HERDR_APP_SANDBOX
+          cleanup() {
+            for file in app.log weston.log; do
+              if [[ -f $root/$file ]]; then cp "$root/$file" "$out/$HERDR_APP_SANDBOX-$file"; fi
+            done
+            scripts/sandbox down
+          }
+          trap cleanup EXIT
+          settings_shot() {
+            scripts/sandbox do app.settings '{"section":"quick-terminal"}'
+            for _ in {1..25}; do
+              scripts/sandbox status >"$out/$HERDR_APP_SANDBOX-status.json"
+              if jq -e 'any(.overlays[]; . == "frame/settings")' "$out/$HERDR_APP_SANDBOX-status.json"; then break; fi
+              sleep .2
+            done
+            jq -e 'any(.overlays[]; . == "frame/settings")' "$out/$HERDR_APP_SANDBOX-status.json"
+            sleep 1
+            timeout 25 scripts/sandbox shot "$out/$HERDR_APP_SANDBOX.png"
+            tesseract "$out/$HERDR_APP_SANDBOX.png" "$out/$HERDR_APP_SANDBOX" 2>/dev/null
+            grep -i 'global shortcut' "$out/$HERDR_APP_SANDBOX.txt"
+          }
+          scripts/sandbox up
+          settings_shot
+          cleanup
+
+          export HERDR_APP_SANDBOX=openbox-ui
+          root=/var/tmp/herdr-app-$HERDR_APP_SANDBOX
+          install -d "$root/home"
+          echo '{"telemetry":false,"quick_terminal":{"enabled":true,"auto_hide":false,"shortcut":"ctrl-alt-f8","height":0.95}}' >"$root/home/settings.json"
+          export DISPLAY=:97
+          Xvfb "$DISPLAY" -screen 0 1400x1000x24 -nolisten tcp >"$out/xvfb.log" 2>&1 &
+          echo $! >"$root/xpid"
+          echo "$DISPLAY" >"$root/display"
+          for _ in {1..50}; do xdpyinfo >/dev/null 2>&1 && break; sleep .1; done
+          openbox >"$out/openbox.log" 2>&1 &
+          for _ in {1..50}; do xprop -root _NET_SUPPORTED | grep -q _NET_WM_STATE_ABOVE && break; sleep .1; done
+          scripts/sandbox up
+          scripts/sandbox do quick_terminal.hide | jq -e '.ok and (.visible == false)'
+          scripts/sandbox status | jq -e '.quick_terminal | .enabled and (.visible == false) and (.error == null)'
+          scripts/sandbox do quick_terminal.toggle | jq -e '.ok and .visible'
+          scripts/sandbox status | jq -e '.quick_terminal | .enabled and .visible and (.error == null)'
+          settings_shot
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: quick-terminal-linux-ui
+          path: ${{ runner.temp }}/herdr-ui
+          if-no-files-found: ignore
+          retention-days: 7
