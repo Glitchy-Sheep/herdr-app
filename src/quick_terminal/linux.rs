@@ -10,6 +10,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::{
     Event,
@@ -575,7 +576,19 @@ impl Native {
                 0,
             ],
         )?;
-        self.connection.flush().map_err(error)
+        self.connection.flush().map_err(error)?;
+        // A managed MapWindow can still be waiting for the window manager.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut delay = Duration::from_millis(1);
+        while !self.viewable()? {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("The X11 window manager did not show the quick terminal".into());
+            }
+            std::thread::sleep(delay.min(remaining));
+            delay = (delay * 2).min(Duration::from_millis(16));
+        }
+        Ok(())
     }
 
     pub fn hide(&mut self) -> Result<(), String> {
@@ -619,11 +632,17 @@ impl Native {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.connection
+        self.viewable().unwrap_or(false)
+    }
+
+    fn viewable(&self) -> Result<bool, String> {
+        let attributes = self
+            .connection
             .get_window_attributes(self.window)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .is_some_and(|attributes| attributes.map_state == MapState::VIEWABLE)
+            .map_err(error)?
+            .reply()
+            .map_err(error)?;
+        Ok(attributes.map_state == MapState::VIEWABLE)
     }
 
     fn message(&self, window: u32, kind: u32, data: [u32; 5]) -> Result<(), String> {
