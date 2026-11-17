@@ -58,27 +58,45 @@ jobs:
           install -d -m 700 "$XDG_RUNTIME_DIR" "$out"
           export HERDR_APP_SANDBOX=weston-ui
           root=/var/tmp/herdr-app-$HERDR_APP_SANDBOX
+          sb() {
+            env -i HOME="$HOME" PATH="$PATH" USER="$USER" LANG=C.UTF-8 \
+              CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 RUST_BACKTRACE=1 \
+              ZIG_GLOBAL_CACHE_DIR="$ZIG_GLOBAL_CACHE_DIR" ZIG_LOCAL_CACHE_DIR="$ZIG_LOCAL_CACHE_DIR" \
+              XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" DISPLAY="${DISPLAY:-}" \
+              HERDR_APP_SANDBOX="$HERDR_APP_SANDBOX" HERDR_APP_HOME="$root/home" \
+              timeout 180 scripts/sandbox "$@"
+          }
+          start() {
+            if sb up; then return; fi
+            for _ in {1..100}; do
+              if sb status >"$out/$HERDR_APP_SANDBOX-startup.json" 2>"$out/$HERDR_APP_SANDBOX-startup.err"; then return; fi
+              sleep .25
+            done
+            if [[ -f $root/pid ]]; then ps -o pid,ppid,stat,comm -p "$(cat "$root/pid")" || true; fi
+            cat "$root/app.log" "$out/$HERDR_APP_SANDBOX-startup.err" >&2
+            return 1
+          }
           cleanup() {
             for file in app.log weston.log; do
               if [[ -f $root/$file ]]; then cp "$root/$file" "$out/$HERDR_APP_SANDBOX-$file"; fi
             done
-            scripts/sandbox down
+            sb down
           }
           trap cleanup EXIT
           settings_shot() {
-            scripts/sandbox do app.settings '{"section":"quick-terminal"}'
+            sb do app.settings '{"section":"quick-terminal"}'
             for _ in {1..25}; do
-              scripts/sandbox status >"$out/$HERDR_APP_SANDBOX-status.json"
+              sb status >"$out/$HERDR_APP_SANDBOX-status.json"
               if jq -e 'any(.overlays[]; . == "frame-settings")' "$out/$HERDR_APP_SANDBOX-status.json"; then break; fi
               sleep .2
             done
             jq -e 'any(.overlays[]; . == "frame-settings")' "$out/$HERDR_APP_SANDBOX-status.json"
             sleep 1
-            timeout 25 scripts/sandbox shot "$out/$HERDR_APP_SANDBOX.png"
+            sb shot "$out/$HERDR_APP_SANDBOX.png"
             tesseract "$out/$HERDR_APP_SANDBOX.png" "$out/$HERDR_APP_SANDBOX" 2>/dev/null
             grep -i 'global shortcut' "$out/$HERDR_APP_SANDBOX.txt"
           }
-          scripts/sandbox up
+          start
           settings_shot
           cleanup
 
@@ -93,11 +111,11 @@ jobs:
           for _ in {1..50}; do xdpyinfo >/dev/null 2>&1 && break; sleep .1; done
           openbox >"$out/openbox.log" 2>&1 &
           for _ in {1..50}; do xprop -root _NET_SUPPORTED | grep -q _NET_WM_STATE_ABOVE && break; sleep .1; done
-          scripts/sandbox up
-          scripts/sandbox do quick_terminal.hide | jq -e '.ok and (.visible == false)'
-          scripts/sandbox status | jq -e '.quick_terminal | .enabled and (.visible == false) and (.error == null)'
-          scripts/sandbox do quick_terminal.toggle | jq -e '.ok and .visible'
-          scripts/sandbox status | jq -e '.quick_terminal | .enabled and .visible and (.error == null)'
+          start
+          sb do quick_terminal.hide | jq -e '.ok and (.visible == false)'
+          sb status | jq -e '.quick_terminal | .enabled and (.visible == false) and (.error == null)'
+          sb do quick_terminal.toggle | jq -e '.ok and .visible'
+          sb status | jq -e '.quick_terminal | .enabled and .visible and (.error == null)'
           settings_shot
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
