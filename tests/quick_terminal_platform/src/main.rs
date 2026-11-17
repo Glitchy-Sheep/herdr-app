@@ -2,6 +2,8 @@
 mod windows_smoke;
 #[cfg(not(windows))]
 mod x11_layout;
+#[cfg(not(windows))]
+mod x11_visibility;
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -85,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait("window manager ready", &|| {
         !prop(root, "_NET_SUPPORTED").is_empty()
     });
+    x11_visibility::check()?;
     let key_names = herdr_native_backends_check::native::KeyNames::new()?;
     let mut key_drain = herdr_native_backends_check::release::Drain::default();
     key_drain.press(&key_names.normalize("("));
@@ -157,8 +160,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait("previous focus restored", &|| {
         prop(root, "_NET_ACTIVE_WINDOW").first() == Some(&previous)
     });
+    let remap_started = Instant::now();
     native.show()?;
-    wait("quick window remapped", &|| native.is_visible());
+    assert!(native.is_visible(), "show must confirm the Openbox remap");
+    println!("Openbox show completed in {:?}", remap_started.elapsed());
     wait("quick window refocused", &|| {
         prop(root, "_NET_ACTIVE_WINDOW").first() == Some(&xid)
     });

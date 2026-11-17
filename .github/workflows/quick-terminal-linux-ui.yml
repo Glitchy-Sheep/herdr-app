@@ -114,7 +114,7 @@ jobs:
           start
           check_command() {
             local command=$1 visible=$2 status="$out/openbox-$1-status.json"
-            sb do "quick_terminal.$command" | tee "$out/openbox-$command-reply.json" | jq -e '.ok'
+            sb do "quick_terminal.$command" | tee "$out/openbox-$command-reply.json" | jq -e --argjson want "$visible" '.ok and (.visible == $want)'
             for _ in {1..50}; do
               sb status >"$status"
               if jq -e --argjson want "$visible" '.quick_terminal | .enabled and (.visible == $want) and (.error == null)' "$status" >/dev/null; then return; fi
@@ -125,6 +125,10 @@ jobs:
           }
           check_command hide false
           check_command toggle true
+          for i in {1..5}; do
+            sb do quick_terminal.toggle | jq -e '.ok and (.visible == false)'
+            sb do quick_terminal.toggle | jq -e '.ok and .visible'
+          done
           settings_shot
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
