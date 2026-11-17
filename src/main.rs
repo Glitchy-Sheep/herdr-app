@@ -26,10 +26,10 @@ mod mods;
 mod mod_files;
 mod process_cwd;
 mod programs;
+mod quick_terminal;
 mod remote_shell;
 mod restart;
 mod settings;
-mod quick_terminal;
 mod setup;
 mod sound;
 mod spawn;
@@ -164,17 +164,17 @@ fn main() {
         eprintln!("herdr-app: cannot write {}: {e}", mods::app_dir().display());
     }
 
-    let app = gpui_platform::application()
-        // Mods run programs already; the user's own links (dotfiles, Nix) may point out.
-        .with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links());
+    let app = gpui_platform::application();
     app.on_reopen(|cx| {
-            for handle in cx.windows() {
-                if let Some(handle) = handle.downcast::<window::AppWindow>() {
-                    let _ = handle.update(cx, |this, window, cx| this.show_initial_window(window, cx));
-                }
+        for handle in cx.windows() {
+            if let Some(handle) = handle.downcast::<window::AppWindow>() {
+                let _ = handle.update(cx, |this, window, cx| this.show_initial_window(window, cx));
             }
-        });
-    app.run(move |cx| {
+        }
+    });
+    // Mods run programs already; the user's own links (dotfiles, Nix) may point out.
+    app.with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links())
+        .run(move |cx| {
             let fonts = settings::BUNDLED_FONTS.iter().map(|f| std::borrow::Cow::Borrowed(*f)).collect();
             if let Err(e) = cx.text_system().add_fonts(fonts) {
                 tracing::warn!("bundled fonts not loaded: {e:#}");

@@ -40,7 +40,16 @@ jobs:
           HC_INSTALL_DIR="$HOME/.local/bin" sh "$RUNNER_TEMP/install-core.sh"
           echo "$HOME/.local/bin" >>"$GITHUB_PATH"
           printf '\n[profile.dev.package."*"]\nopt-level = 0\n' >>"$HOME/.cargo/config.toml"
-          cargo build --locked
+      - name: Fetch Ghostty's pinned translate-c dependency through Git
+        working-directory: vendor/ghostty
+        run: |
+          scratch=$(mktemp -d)
+          git init -q "$scratch/repo"
+          git -C "$scratch/repo" fetch --depth=1 https://codeberg.org/vancluever/translate-c.git 4e879eb8aba615de112eabd1231ea6e01920cead
+          git -C "$scratch/repo" archive --format=tar --prefix=translate-c/ --output="$scratch/translate-c.tar" FETCH_HEAD
+          test "$(zig fetch "$scratch/translate-c.tar")" = translate_c-0.0.0-Q_BUWhVNBwDOEcIqub4VFPJPB6D9dgwzUMHTX5KWr8Xr
+      - name: Build Herdr
+        run: cargo build --locked
       - name: Run the full app on the sandbox display and a private X11 desktop
         run: |
           set -euo pipefail
