@@ -83,6 +83,15 @@ jobs:
       - name: Windows build dependencies
         if: runner.os == 'Windows'
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+      - name: Fetch pinned Ghostty dependency over Git
+        working-directory: vendor/ghostty
+        run: |
+          scratch=$(mktemp -d)
+          git init -q "$scratch/repo"
+          git -C "$scratch/repo" fetch --depth=1 https://codeberg.org/vancluever/translate-c.git 4e879eb8aba615de112eabd1231ea6e01920cead
+          git -C "$scratch/repo" archive --format=tar --prefix=translate-c/ --output="$scratch/translate-c.tar" FETCH_HEAD
+          expected=translate_c-0.0.0-Q_BUWhVNBwDOEcIqub4VFPJPB6D9dgwzUMHTX5KWr8Xr
+          test "$(zig fetch "$scratch/translate-c.tar")" = "$expected"
       - name: Keep unchanged sources fresh
         run: scripts/ci-sources restore
       # Compile the screenshot harness everywhere, even without a desktop.
