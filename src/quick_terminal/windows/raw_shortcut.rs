@@ -1,6 +1,7 @@
 //! Background input for an explicitly configured double-modifier shortcut.
 
-use super::double_tap::{DoubleTap, Gesture, MAX_GAP_MS, ModifierKey, TapPhase};
+use super::super::windows_recording::{RecordingPeriod, ShortcutTarget, message_time};
+use super::double_tap::{DoubleTap, Gesture, ModifierKey};
 use std::{io, ptr, sync::Mutex};
 use windows_sys::Win32::{
     Foundation::HWND,
@@ -8,23 +9,26 @@ use windows_sys::Win32::{
         Input::{
             GetRawInputData, GetRegisteredRawInputDevices,
             KeyboardAndMouse::{
-                GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
-                VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+                GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
+                VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+                VK_XBUTTON1, VK_XBUTTON2,
             },
             RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RID_INPUT, RIDEV_INPUTSINK,
             RIDEV_REMOVE, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, GetQueueStatus, HWND_MESSAGE,
-            KillTimer, MSG, QS_RAWINPUT, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RIM_INPUT, SetTimer,
-            WM_INPUT, WM_TIMER,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, GetQueueStatus, HWND_MESSAGE, MSG,
+            QS_RAWINPUT, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RI_MOUSE_BUTTON_4_DOWN,
+            RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP,
+            RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN,
+            RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP,
+            RIM_INPUT, WM_INPUT,
         },
     },
 };
 
 const MOUSE: u16 = 2;
 const KEYBOARD: u16 = 6;
-const GESTURE_TIMER: usize = 1;
 static REGISTRATION: Mutex<()> = Mutex::new(());
 
 struct MessageWindow(HWND);
@@ -126,108 +130,63 @@ impl Drop for Device {
 pub(super) struct RawShortcut {
     gesture: Gesture,
     input: GestureInput,
-    mouse: Option<Device>,
+    _mouse: Device,
     _keyboard: Device,
     window: MessageWindow,
-    error_reported: bool,
 }
 
 impl RawShortcut {
     pub(super) fn new(gesture: Gesture) -> Result<Self, String> {
         let window = MessageWindow::new()?;
-        let input = GestureInput::at_registration();
+        // Both devices feed one queue, including clicks before the first modifier is dequeued.
+        let mouse = Device::register(window.0, MOUSE)?;
         let keyboard = Device::register(window.0, KEYBOARD)?;
         Ok(Self {
             gesture,
-            input,
-            mouse: None,
+            input: GestureInput::at_registration(),
+            _mouse: mouse,
             _keyboard: keyboard,
             window,
-            error_reported: false,
         })
     }
 
     pub(super) fn handle(&mut self, message: &MSG) {
-        if message.hwnd != self.window.0 {
+        if message.hwnd != self.window.0 || message.message != WM_INPUT {
             return;
         }
-        let completed = match message.message {
-            WM_INPUT => {
-                let mut packet = RAWINPUT::default();
-                let mut size = size_of::<RAWINPUT>() as u32;
-                let read = unsafe {
-                    GetRawInputData(
-                        message.lParam as _,
-                        RID_INPUT,
-                        (&mut packet as *mut RAWINPUT).cast(),
-                        &mut size,
-                        size_of::<RAWINPUTHEADER>() as u32,
-                    )
-                };
-                if message.wParam == RIM_INPUT as usize {
-                    unsafe {
-                        DefWindowProcW(message.hwnd, WM_INPUT, message.wParam, message.lParam)
-                    };
-                }
-                if read == u32::MAX {
-                    self.input.tap = DoubleTap::default();
-                    false
-                } else {
-                    self.input.recognize(
-                        self.gesture,
-                        &packet,
-                        message.time,
-                        crate::quick_terminal::recording_active(),
-                        chord_at_queue_tail,
-                    )
-                }
-            }
-            WM_TIMER if message.wParam == GESTURE_TIMER => {
-                self.input.tap.refresh(message.time);
-                false
-            }
-            _ => return,
+        let mut packet = RAWINPUT::default();
+        let mut size = size_of::<RAWINPUT>() as u32;
+        let read = unsafe {
+            GetRawInputData(
+                message.lParam as _,
+                RID_INPUT,
+                (&mut packet as *mut RAWINPUT).cast(),
+                &mut size,
+                size_of::<RAWINPUTHEADER>() as u32,
+            )
         };
-        if let Err(error) = self.watch_buttons() {
-            self.input.tap.interrupt();
-            if !self.error_reported {
-                crate::mods::request(crate::mods::Request::QuickTerminalShortcutError(Some(
-                    error.clone(),
-                )));
-                super::report_error(error);
-                self.error_reported = true;
-            }
-        } else {
-            if self.error_reported && self.mouse.is_some() {
-                crate::mods::request(crate::mods::Request::QuickTerminalShortcutError(None));
-                self.error_reported = false;
-            }
-            if completed && !crate::quick_terminal::recording_active() {
-                super::request("quick_terminal.toggle");
-            }
+        if message.wParam == RIM_INPUT as usize {
+            unsafe { DefWindowProcW(message.hwnd, WM_INPUT, message.wParam, message.lParam) };
         }
-    }
-
-    // Mouse motion should only reach this window while a candidate gesture is in progress.
-    fn watch_buttons(&mut self) -> Result<(), String> {
-        match (self.input.tap.phase(), self.mouse.is_some()) {
-            (TapPhase::Idle, true) => {
-                unsafe { KillTimer(self.window.0, GESTURE_TIMER) };
-                self.mouse = None;
-            }
-            (TapPhase::Down(_) | TapPhase::Waiting(_), false) => {
-                let mouse = Device::register(self.window.0, MOUSE)?;
-                if unsafe { SetTimer(self.window.0, GESTURE_TIMER, MAX_GAP_MS + 1, None) } == 0 {
-                    return Err(format!(
-                        "Cannot time the double-tap shortcut: {}",
-                        io::Error::last_os_error()
-                    ));
-                }
-                self.mouse = Some(mouse);
-            }
-            _ => {}
+        if read == u32::MAX {
+            self.input.tap = DoubleTap::default();
+            return;
         }
-        Ok(())
+        if packet.header.dwType == RIM_TYPEMOUSE
+            && unsafe { packet.data.mouse.Anonymous.Anonymous.usButtonFlags } == 0
+        {
+            return;
+        }
+        let posted = message_time(message.time);
+        if self.input.recognize(
+            self.gesture,
+            &packet,
+            posted,
+            RecordingPeriod::current(),
+            chord_at_queue_tail,
+        ) {
+            super::request_shortcut(posted, None);
+        }
     }
 }
 
@@ -235,13 +194,14 @@ impl RawShortcut {
 struct GestureInput {
     tap: DoubleTap,
     pressed: [u64; 4],
+    recording: RecordingPeriod,
 }
 
 impl GestureInput {
     fn at_registration() -> Self {
         let mut input = Self::default();
-        // A key can already be held when the raw keyboard starts delivering events.
-        for vk in 8..=0xfe {
+        // A key or mouse button may already be down when registration starts.
+        for vk in 1..=0xfe {
             if unsafe { GetAsyncKeyState(i32::from(vk)) < 0 } {
                 input.set_pressed(vk, true);
             }
@@ -282,13 +242,15 @@ impl GestureInput {
         &mut self,
         gesture: Gesture,
         packet: &RAWINPUT,
-        time: u32,
-        suspended: bool,
+        posted: u64,
+        recording: RecordingPeriod,
         live_chord: impl FnOnce(ModifierKey) -> Option<bool>,
     ) -> bool {
-        if suspended {
+        let suspended = !matches!(recording.target(posted), ShortcutTarget::Terminal);
+        if suspended || recording != self.recording {
             self.tap = DoubleTap::default();
         }
+        self.recording = recording;
         match packet.header.dwType {
             RIM_TYPEKEYBOARD => {
                 let event = unsafe { packet.data.keyboard };
@@ -299,7 +261,7 @@ impl GestureInput {
                 if !suspended && let Some(key) = modifier.filter(|key| gesture.accepts(*key)) {
                     let chord =
                         down && self.tap.can_start_press() && self.in_chord(key, live_chord(key));
-                    let completed = self.tap.key(key, down, time);
+                    let completed = self.tap.key(key, down, posted as u32);
                     if chord {
                         self.tap.interrupt();
                     }
@@ -307,10 +269,35 @@ impl GestureInput {
                 }
                 self.tap.interrupt();
             }
-            RIM_TYPEMOUSE
-                if unsafe { packet.data.mouse.Anonymous.Anonymous.usButtonFlags } != 0 =>
-            {
-                self.tap.interrupt()
+            RIM_TYPEMOUSE => {
+                let flags =
+                    u32::from(unsafe { packet.data.mouse.Anonymous.Anonymous.usButtonFlags });
+                if flags != 0 {
+                    for (vk, down, up) in [
+                        (
+                            VK_LBUTTON,
+                            RI_MOUSE_LEFT_BUTTON_DOWN,
+                            RI_MOUSE_LEFT_BUTTON_UP,
+                        ),
+                        (
+                            VK_RBUTTON,
+                            RI_MOUSE_RIGHT_BUTTON_DOWN,
+                            RI_MOUSE_RIGHT_BUTTON_UP,
+                        ),
+                        (
+                            VK_MBUTTON,
+                            RI_MOUSE_MIDDLE_BUTTON_DOWN,
+                            RI_MOUSE_MIDDLE_BUTTON_UP,
+                        ),
+                        (VK_XBUTTON1, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP),
+                        (VK_XBUTTON2, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP),
+                    ] {
+                        if flags & (down | up) != 0 {
+                            self.set_pressed(vk, flags & up == 0);
+                        }
+                    }
+                    self.tap.interrupt();
+                }
             }
             _ => {}
         }
@@ -367,7 +354,6 @@ mod tests {
     use windows_sys::Win32::UI::{
         Input::KeyboardAndMouse::{VK_LWIN, VK_RWIN, VK_TAB},
         Input::{RAWINPUT_0, RAWMOUSE, RAWMOUSE_0, RAWMOUSE_0_0},
-        WindowsAndMessaging::RI_MOUSE_LEFT_BUTTON_DOWN,
     };
 
     fn key(vk: u16, scan: u16, flags: u32) -> RAWINPUT {
@@ -385,6 +371,90 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn mouse(flags: u32) -> RAWINPUT {
+        RAWINPUT {
+            header: RAWINPUTHEADER {
+                dwType: RIM_TYPEMOUSE,
+                ..Default::default()
+            },
+            data: RAWINPUT_0 {
+                mouse: RAWMOUSE {
+                    Anonymous: RAWMOUSE_0 {
+                        Anonymous: RAWMOUSE_0_0 {
+                            usButtonFlags: flags as u16,
+                            ..Default::default()
+                        },
+                    },
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn queued_mouse_edges_cancel_taps_and_held_buttons_block_new_gestures() {
+        let alt_down = key(VK_MENU, 0x38, 0);
+        let alt_up = key(VK_MENU, 0x38, RI_KEY_BREAK);
+        let gesture = Gesture::parse("double-left-alt").unwrap().unwrap();
+        let mut input = GestureInput::default();
+        for (at, packet, expected) in [
+            (0, alt_down, false),
+            (10, alt_up, false),
+            (20, mouse(RI_MOUSE_LEFT_BUTTON_DOWN), false),
+            (30, mouse(RI_MOUSE_LEFT_BUTTON_UP), false),
+            (40, alt_down, false),
+            (50, alt_up, false),
+            (60, mouse(RI_MOUSE_BUTTON_4_DOWN), false),
+            (70, alt_down, false),
+            (80, alt_up, false),
+            (90, alt_down, false),
+            (100, alt_up, false),
+            (110, mouse(RI_MOUSE_BUTTON_4_UP), false),
+            (120, alt_down, false),
+            (130, alt_up, false),
+            (140, mouse(0), false),
+            (150, alt_down, false),
+            (160, alt_up, true),
+        ] {
+            assert_eq!(
+                input.recognize(gesture, &packet, at, RecordingPeriod::Never, |_| None),
+                expected,
+                "packet at {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_recorded_taps_cannot_toggle_after_the_recorder_closes() {
+        let down = key(VK_MENU, 0x38, 0);
+        let up = key(VK_MENU, 0x38, RI_KEY_BREAK);
+        let gesture = Gesture::parse("double-left-alt").unwrap().unwrap();
+        let mut input = GestureInput::default();
+        let closed = RecordingPeriod::FinishedAt(75);
+        for (time, packet, expected) in [
+            (15, down, false),
+            (25, up, false),
+            (65, down, false),
+            (75, up, false),
+            (80, down, false),
+            (90, up, false),
+            (120, down, false),
+            (130, up, true),
+        ] {
+            assert_eq!(
+                input.recognize(gesture, &packet, time, closed, |_| None),
+                expected
+            );
+        }
+
+        // A recording with no input still separates two partial global gestures.
+        assert!(!input.recognize(gesture, &down, 150, closed, |_| None));
+        assert!(!input.recognize(gesture, &up, 160, closed, |_| None));
+        let later = RecordingPeriod::FinishedAt(180);
+        assert!(!input.recognize(gesture, &down, 200, later, |_| None));
+        assert!(!input.recognize(gesture, &up, 210, later, |_| None));
     }
 
     #[test]
@@ -411,7 +481,7 @@ mod tests {
                 (130, release, true),
             ] {
                 assert_eq!(
-                    input.recognize(gesture, &packet, at, false, |_| None),
+                    input.recognize(gesture, &packet, at, RecordingPeriod::Never, |_| None),
                     expected
                 );
             }
@@ -439,7 +509,7 @@ mod tests {
             (80, up, true),
         ] {
             assert_eq!(
-                input.recognize(gesture, &packet, at, false, |_| None),
+                input.recognize(gesture, &packet, at, RecordingPeriod::Never, |_| None),
                 expected
             );
         }
@@ -459,7 +529,7 @@ mod tests {
             (40, up, None, true),
         ] {
             assert_eq!(
-                input.recognize(gesture, &packet, at, false, |_| live_chord),
+                input.recognize(gesture, &packet, at, RecordingPeriod::Never, |_| live_chord),
                 expected
             );
         }
@@ -469,28 +539,12 @@ mod tests {
     fn raw_chords_alt_tab_altgr_mouse_and_prior_held_keys_interrupt() {
         let left = key(VK_MENU, 0x38, 0);
         let up = key(VK_MENU, 0x38, RI_KEY_BREAK);
-        let click = RAWINPUT {
-            header: RAWINPUTHEADER {
-                dwType: RIM_TYPEMOUSE,
-                ..Default::default()
-            },
-            data: RAWINPUT_0 {
-                mouse: RAWMOUSE {
-                    Anonymous: RAWMOUSE_0 {
-                        Anonymous: RAWMOUSE_0_0 {
-                            usButtonFlags: RI_MOUSE_LEFT_BUTTON_DOWN as u16,
-                            ..Default::default()
-                        },
-                    },
-                    ..Default::default()
-                },
-            },
-        };
+        let click = mouse(RI_MOUSE_LEFT_BUTTON_DOWN);
         let gesture = Gesture::parse("double-left-alt").unwrap().unwrap();
         for interrupt in [key(VK_TAB, 0x0f, 0), key(VK_MENU, 0x38, RI_KEY_E0), click] {
             let mut input = GestureInput::default();
             for (at, packet) in [(0, left), (20, up), (50, left), (55, interrupt), (60, up)] {
-                assert!(!input.recognize(gesture, &packet, at, false, |_| None));
+                assert!(!input.recognize(gesture, &packet, at, RecordingPeriod::Never, |_| None));
             }
         }
         // An already-held Ctrl also represents AltGr on layouts which emulate Ctrl+Alt.
@@ -505,7 +559,7 @@ mod tests {
             (40, make, false),
             (60, release, false),
         ] {
-            assert!(!input.recognize(right, &packet, at, false, |_| Some(held)));
+            assert!(!input.recognize(right, &packet, at, RecordingPeriod::Never, |_| Some(held)));
         }
     }
 }

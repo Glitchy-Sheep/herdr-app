@@ -160,15 +160,16 @@ pub fn open_permission_settings(panel: Option<&Native>) -> Result<(), String> {
         }
     }
     if let Some(panel) = panel {
-        panel.order_out(FocusAfterHide::SystemSettings);
+        panel.order_out(HideReason::SystemSettings);
     }
     Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FocusAfterHide {
-    PreviousApp,
+enum HideReason {
+    Explicit,
     SystemSettings,
+    FocusLost,
 }
 
 #[derive(Default)]
@@ -273,6 +274,19 @@ fn frame_size(frame: NSRect) -> SavedSize {
 }
 
 impl State {
+    fn should_auto_hide(&self) -> bool {
+        if !self.auto_hide.get() {
+            return false;
+        }
+        unsafe {
+            let visible: BOOL = msg_send![self.window, isVisible];
+            let key: BOOL = msg_send![self.window, isKeyWindow];
+            let app = NSApplication::sharedApplication(nil);
+            let key_window: id = msg_send![app, keyWindow];
+            visible == YES && key == NO && key_window.is_null()
+        }
+    }
+
     fn shortcut_pressed(&self) {
         if self.shortcut_suspended.get() || RECORDING.get() {
             return;
@@ -535,17 +549,8 @@ impl Native {
             // AppKit settles the next key window after delivering resign-key notifications.
             let later = ConcreteBlock::new(move || {
                 let Some(state) = state.upgrade() else { return };
-                if !state.auto_hide.get() {
-                    return;
-                }
-                unsafe {
-                    let visible: BOOL = msg_send![state.window, isVisible];
-                    let key: BOOL = msg_send![state.window, isKeyWindow];
-                    let app = NSApplication::sharedApplication(nil);
-                    let other_key: id = msg_send![app, keyWindow];
-                    if visible == YES && key == NO && other_key.is_null() {
-                        crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
-                    }
+                if state.should_auto_hide() {
+                    crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
                 }
             })
             .copy();
@@ -606,7 +611,7 @@ impl Native {
                     }
                 }
             }
-            self.schedule(true, move |state| {
+            self.schedule(Some(true), move |state| {
                 state.resize.borrow_mut().placing = true;
                 let _: () = msg_send![state.window, herdrSetQuickResizeBounds: frame];
                 let app = NSApplication::sharedApplication(nil);
@@ -638,13 +643,24 @@ impl Native {
 
     pub fn hide(&mut self) -> Result<(), String> {
         if self.state.pending.get() != Some(false) {
-            self.order_out(FocusAfterHide::PreviousApp);
+            self.order_out(HideReason::Explicit);
         }
         Ok(())
     }
 
-    fn order_out(&self, focus: FocusAfterHide) {
-        self.schedule(false, move |state| unsafe {
+    pub fn hide_on_blur(&mut self) -> Result<(), String> {
+        if self.state.pending.get().is_none() {
+            self.order_out(HideReason::FocusLost);
+        }
+        Ok(())
+    }
+
+    fn order_out(&self, reason: HideReason) {
+        let pending = (reason != HideReason::FocusLost).then_some(false);
+        self.schedule(pending, move |state| unsafe {
+            if reason == HideReason::FocusLost && !state.should_auto_hide() {
+                return;
+            }
             let was_key: BOOL = msg_send![state.window, isKeyWindow];
             let _: () = msg_send![state.window, orderOut: nil];
             let previous = state.previous_app.replace(nil);
@@ -657,7 +673,7 @@ impl Native {
                     msg_send![front, processIdentifier]
                 };
                 // A nonactivating panel normally leaves the previous app active already.
-                if focus == FocusAfterHide::PreviousApp
+                if reason == HideReason::Explicit
                     && was_key == YES
                     && front_pid == std::process::id() as i32
                 {
@@ -738,10 +754,10 @@ impl Native {
     }
 
     // Native window notifications must run outside GPUI's current window update.
-    fn schedule(&self, visible: bool, action: impl Fn(&State) + 'static) {
+    fn schedule(&self, visible: Option<bool>, action: impl Fn(&State) + 'static) {
         let generation = self.state.generation.get().wrapping_add(1);
         self.state.generation.set(generation);
-        self.state.pending.set(Some(visible));
+        self.state.pending.set(visible);
         let state = Rc::downgrade(&self.state);
         let block = ConcreteBlock::new(move || {
             let Some(state) = state.upgrade() else { return };

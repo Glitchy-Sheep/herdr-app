@@ -149,14 +149,7 @@ impl Hotkey {
         let mut grabs = keyboard::Grabs::default();
         grabs.update(&connection, root, &chord)?;
         let active_atom = atom(&connection, "_NET_ACTIVE_WINDOW")?;
-        let mut was_active = property(
-            &connection,
-            root,
-            "_NET_ACTIVE_WINDOW",
-            AtomEnum::WINDOW.into(),
-        )?
-        .first()
-            == Some(&window);
+        let mut was_active = active_window(&connection, root)? == window;
         connection
             .change_window_attributes(
                 root,
@@ -188,17 +181,13 @@ impl Hotkey {
                     }
                     Ok(Some(Event::KeyRelease(event))) if held == Some(event.detail) => held = None,
                     Ok(Some(Event::PropertyNotify(event))) if event.window == root && event.atom == active_atom => {
-                        let active = property(&connection, root, "_NET_ACTIVE_WINDOW", AtomEnum::WINDOW.into()).ok().and_then(|p| p.first().copied()).unwrap_or(0);
+                        let Ok(active) = active_window(&connection, root) else { continue };
                         if active == window {
                             was_active = true;
-                        } else if was_active {
-                            let owned_dialog = active != 0 && property(&connection, active, "_NET_WM_PID", AtomEnum::CARDINAL.into()).ok()
-                                .is_some_and(|p| p.first() == Some(&std::process::id()));
-                            if !owned_dialog {
-                                was_active = false;
-                                if auto_hide.load(Ordering::SeqCst) {
-                                    crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
-                                }
+                        } else if was_active && herdr_window(&connection, active, window) == Ok(false) {
+                            was_active = false;
+                            if auto_hide.load(Ordering::SeqCst) {
+                                crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
                             }
                         }
                     }
@@ -419,15 +408,7 @@ impl Native {
 
     pub fn show(&mut self) -> Result<(), String> {
         *self.recenter.lock().unwrap() = None;
-        let previous = property(
-            &self.connection,
-            self.root,
-            "_NET_ACTIVE_WINDOW",
-            AtomEnum::WINDOW.into(),
-        )?
-        .first()
-        .copied()
-        .unwrap_or(0);
+        let previous = active_window(&self.connection, self.root)?;
         if previous != 0 && previous != self.window {
             self.previous = previous;
         }
@@ -592,16 +573,21 @@ impl Native {
     }
 
     pub fn hide(&mut self) -> Result<(), String> {
+        self.unmap(active_window(&self.connection, self.root)?)
+    }
+
+    pub fn hide_on_blur(&mut self) -> Result<(), String> {
+        let active = active_window(&self.connection, self.root)?;
+        if self.auto_hide.load(Ordering::SeqCst)
+            && !herdr_window(&self.connection, active, self.window)?
+        {
+            self.unmap(active)?;
+        }
+        Ok(())
+    }
+
+    fn unmap(&mut self, active: u32) -> Result<(), String> {
         *self.recenter.lock().unwrap() = None;
-        let active = property(
-            &self.connection,
-            self.root,
-            "_NET_ACTIVE_WINDOW",
-            AtomEnum::WINDOW.into(),
-        )?
-        .first()
-        .copied()
-        .unwrap_or(0);
         self.connection
             .unmap_window(self.window)
             .map_err(error)?
@@ -723,6 +709,40 @@ fn atom(connection: &RustConnection, name: &str) -> Result<u32, String> {
         .reply()
         .map_err(error)?
         .atom)
+}
+
+fn active_window(connection: &RustConnection, root: u32) -> Result<u32, String> {
+    Ok(property(
+        connection,
+        root,
+        "_NET_ACTIVE_WINDOW",
+        AtomEnum::WINDOW.into(),
+    )?
+    .first()
+    .copied()
+    .unwrap_or(0))
+}
+
+fn herdr_window(connection: &RustConnection, mut window: u32, panel: u32) -> Result<bool, String> {
+    let mut visited = std::collections::HashSet::new();
+    while window != 0 && visited.insert(window) {
+        if window == panel
+            || property(connection, window, "_NET_WM_PID", AtomEnum::CARDINAL.into())?.first()
+                == Some(&std::process::id())
+        {
+            return Ok(true);
+        }
+        window = property(
+            connection,
+            window,
+            "WM_TRANSIENT_FOR",
+            AtomEnum::WINDOW.into(),
+        )?
+        .first()
+        .copied()
+        .unwrap_or(0);
+    }
+    Ok(false)
 }
 
 fn property(

@@ -401,7 +401,9 @@ pub enum Request {
     Run { name: String, args: Value },
     QuickTerminalAutoHide,
     ShortcutRecording { copy: u64, action: String },
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    WindowsQuickTerminalShortcut { posted: u64, chord: Option<String> },
+    #[cfg(target_os = "linux")]
     ShortcutRecorded { shortcut: String },
     #[cfg(not(target_os = "macos"))]
     QuickTerminalShortcutError(Option<String>),

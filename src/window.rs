@@ -4126,7 +4126,22 @@ impl AppWindow {
                 }
                 cx.notify();
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(windows)]
+            Request::WindowsQuickTerminalShortcut { posted, chord } => {
+                use crate::quick_terminal::{ShortcutTarget, shortcut_target};
+                match shortcut_target(posted) {
+                    ShortcutTarget::Terminal => self.run("quick_terminal.toggle", Value::Null, window, cx),
+                    ShortcutTarget::Recorder => {
+                        if let Some(shortcut) = chord {
+                            self.quick_terminal.poll_recording(window);
+                            self.quick_terminal.recorded_shortcut(&shortcut);
+                            cx.notify();
+                        }
+                    }
+                    ShortcutTarget::Ignore => {}
+                }
+            }
+            #[cfg(target_os = "linux")]
             Request::ShortcutRecorded { shortcut } => {
                 self.quick_terminal.poll_recording(window);
                 self.quick_terminal.recorded_shortcut(&shortcut);

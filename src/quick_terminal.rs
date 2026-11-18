@@ -3,16 +3,16 @@
 use gpui::Window;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{
-    LazyLock, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 #[cfg(any(not(target_os = "macos"), test))]
 mod release;
 #[cfg(any(not(target_os = "macos"), test))]
 use release::released_status;
 
+#[cfg(target_os = "linux")]
 static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING: LazyLock<Mutex<(Option<u64>, Value)>> =
     LazyLock::new(|| Mutex::new((None, json!({ "state": "idle" }))));
@@ -99,13 +99,8 @@ pub fn recording_status(owner: u64) -> Value {
     }
 }
 
-#[cfg(windows)]
-pub fn recording_active() -> bool {
-    RECORDING_ACTIVE.load(Ordering::SeqCst)
-}
-
 /// Reserved global keys reach the recorder through their native hotkey callback.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub fn record_shortcut(shortcut: &str) -> bool {
     if !RECORDING_ACTIVE.load(Ordering::SeqCst) {
         return false;
@@ -236,6 +231,8 @@ mod windows;
 mod windows_recording;
 #[cfg(windows)]
 use windows::{KeyNames, Native};
+#[cfg(windows)]
+pub(crate) use windows_recording::{ShortcutTarget, shortcut_target};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -406,7 +403,7 @@ impl QuickTerminal {
         if self.config.auto_hide
             && let Some(native) = &mut self.native
         {
-            native.hide()?;
+            native.hide_on_blur()?;
         }
         Ok(())
     }
@@ -607,6 +604,7 @@ impl QuickTerminal {
         }
         self.record_owner = Some(owner);
         self.record_focus = window.focused(cx);
+        #[cfg(target_os = "linux")]
         RECORDING_ACTIVE.store(true, Ordering::SeqCst);
         prepare_recording(owner);
         Ok(())
@@ -736,6 +734,7 @@ impl QuickTerminal {
         #[cfg(windows)]
         self.modifier_recorder.take();
         self.record_focus = None;
+        #[cfg(target_os = "linux")]
         RECORDING_ACTIVE.store(false, Ordering::SeqCst);
         if let Some(owner) = owner {
             if !preserve_status {
