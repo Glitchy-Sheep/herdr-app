@@ -27,13 +27,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, GWL_STYLE, GetAncestor, GetCursorPos, GetForegroundWindow, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, MINMAXINFO, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT, WM_APP, WM_ENTERSIZEMOVE,
-    WM_GETMINMAXINFO, WM_HOTKEY, WM_NCDESTROY, WM_QUIT, WM_SIZING, WMSZ_BOTTOMLEFT,
-    WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WS_MAXIMIZEBOX,
+    EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, GWL_STYLE, GetAncestor, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, MINMAXINFO, MSG, PM_NOREMOVE,
+    PeekMessageW, PostThreadMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED,
+    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WINEVENT_OUTOFCONTEXT, WM_APP, WM_ENTERSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY, WM_NCDESTROY,
+    WM_QUIT, WM_SIZING, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOPLEFT,
+    WMSZ_TOPRIGHT, WS_MAXIMIZEBOX,
 };
 
 const HOTKEY_ID: i32 = 0x4844;
@@ -147,14 +148,18 @@ struct FocusState {
     auto_hide: Arc<AtomicBool>,
 }
 
-fn focused_outside_herdr(panel: HWND, foreground: HWND) -> bool {
-    if foreground.is_null() || foreground == panel {
-        return false;
+fn herdr_has_focus(panel: HWND, foreground: HWND) -> Option<bool> {
+    if foreground.is_null() {
+        return None;
+    }
+    if foreground == panel {
+        return Some(true);
     }
     let mut pid = 0;
     unsafe {
         GetWindowThreadProcessId(foreground, &mut pid);
-        pid != 0 && pid != GetCurrentProcessId() && GetAncestor(foreground, GA_ROOTOWNER) != panel
+        (pid != 0)
+            .then(|| pid == GetCurrentProcessId() || GetAncestor(foreground, GA_ROOTOWNER) == panel)
     }
 }
 
@@ -171,13 +176,14 @@ unsafe extern "system" fn foreground_changed(
     FOCUS.with(|focus| {
         let mut focus = focus.borrow_mut();
         let Some(focus) = focus.as_mut() else { return };
-        if hwnd as usize == focus.window {
-            focus.was_active = true;
-        } else if focus.was_active && focused_outside_herdr(focus.window as HWND, hwnd) {
-            focus.was_active = false;
-            if focus.auto_hide.load(Ordering::SeqCst) {
-                crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
-            }
+        let Some(active) = herdr_has_focus(focus.window as HWND, hwnd) else {
+            return;
+        };
+        if std::mem::replace(&mut focus.was_active, active)
+            && !active
+            && focus.auto_hide.load(Ordering::SeqCst)
+        {
+            crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
         }
     });
 }
@@ -331,7 +337,7 @@ impl Hotkey {
                 FOCUS.with(|focus| {
                     *focus.borrow_mut() = Some(FocusState {
                         window,
-                        was_active: GetForegroundWindow() == hwnd,
+                        was_active: herdr_has_focus(hwnd, GetForegroundWindow()) == Some(true),
                         auto_hide: auto_hide.clone(),
                     })
                 });
@@ -685,7 +691,7 @@ impl WindowOps {
                 return Err("quick terminal window is no longer available".into());
             }
             let foreground = GetForegroundWindow();
-            if on_blur && !focused_outside_herdr(self.hwnd, foreground) {
+            if on_blur && herdr_has_focus(self.hwnd, foreground) != Some(false) {
                 return Ok(());
             }
             ShowWindow(self.hwnd, SW_HIDE);

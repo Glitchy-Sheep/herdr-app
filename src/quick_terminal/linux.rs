@@ -149,7 +149,8 @@ impl Hotkey {
         let mut grabs = keyboard::Grabs::default();
         grabs.update(&connection, root, &chord)?;
         let active_atom = atom(&connection, "_NET_ACTIVE_WINDOW")?;
-        let mut was_active = active_window(&connection, root)? == window;
+        let mut was_active =
+            herdr_window(&connection, active_window(&connection, root)?, window).unwrap_or(false);
         connection
             .change_window_attributes(
                 root,
@@ -182,13 +183,9 @@ impl Hotkey {
                     Ok(Some(Event::KeyRelease(event))) if held == Some(event.detail) => held = None,
                     Ok(Some(Event::PropertyNotify(event))) if event.window == root && event.atom == active_atom => {
                         let Ok(active) = active_window(&connection, root) else { continue };
-                        if active == window {
-                            was_active = true;
-                        } else if was_active && herdr_window(&connection, active, window) == Ok(false) {
-                            was_active = false;
-                            if auto_hide.load(Ordering::SeqCst) {
-                                crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
-                            }
+                        let Ok(inside) = herdr_window(&connection, active, window) else { continue };
+                        if std::mem::replace(&mut was_active, inside) && !inside && auto_hide.load(Ordering::SeqCst) {
+                            crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
                         }
                     }
                     Ok(Some(Event::XkbMapNotify(_) | Event::XkbNewKeyboardNotify(_))) => {

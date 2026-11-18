@@ -563,7 +563,8 @@ impl Native {
         unsafe {
             let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
             let name = NSString::alloc(nil).init_str("NSWindowDidResignKeyNotification");
-            let observer: id = msg_send![center, addObserverForName: name object: self.state.window queue: nil usingBlock: &*block];
+            // A dialog can be the last Herdr window to lose keyboard focus.
+            let observer: id = msg_send![center, addObserverForName: name object: nil queue: nil usingBlock: &*block];
             let _: () = msg_send![name, release];
             if !observer.is_null() {
                 let _: id = msg_send![observer, retain];
