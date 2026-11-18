@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 9966d44f2c07e074a8b5c4193c89644f4cc7344f
+          ref: 525229858d294c5f583a73285714c9781cbd5b4b
           submodules: true
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
@@ -40,7 +40,7 @@ jobs:
         env:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
         run: |
-          test "$(git rev-parse HEAD)" = 9966d44f2c07e074a8b5c4193c89644f4cc7344f
+          test "$(git rev-parse HEAD)" = 525229858d294c5f583a73285714c9781cbd5b4b
           unset HERDR_APP_RELEASE
           cargo build --release --locked --bin herdr-app
           target/release/herdr-app.exe --version | tr -d '\r' | grep -x 'herdr-app 0.1.16'
@@ -56,7 +56,7 @@ jobs:
           Copy-Item -LiteralPath assets/icons/herdr-ui-icon-clean.svg -Destination "$stage/herdr-app.svg"
           Copy-Item -LiteralPath LICENSE, THIRD-PARTY-NOTICES -Destination $stage
           New-Item -ItemType Directory -Path dist | Out-Null
-          $zip = 'dist/Herdr-Quick-Terminal-9966d44-windows-x64.zip'
+          $zip = 'dist/Herdr-Quick-Terminal-5252298-windows-x64.zip'
           Compress-Archive -Path "$stage/*" -DestinationPath $zip -CompressionLevel Optimal
           $hashes = foreach ($path in @("$stage/herdr-app.exe", $zip)) {
             '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant(), (Split-Path -Leaf $path)
@@ -65,7 +65,7 @@ jobs:
           $hashes
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: quick-terminal-windows-x64-9966d44
+          name: quick-terminal-windows-x64-5252298
           path: dist/
           if-no-files-found: error
           retention-days: 14
