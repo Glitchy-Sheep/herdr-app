@@ -2,6 +2,10 @@
 
 #[path = "chord.rs"]
 mod chord;
+#[path = "windows/double_tap.rs"]
+pub(crate) mod double_tap;
+#[path = "windows/raw_shortcut.rs"]
+mod raw_shortcut;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
@@ -37,7 +41,67 @@ const SHOW: u32 = WM_APP + 1;
 const HIDE: u32 = WM_APP + 2;
 
 pub fn validate_shortcut(text: &str) -> Result<(), String> {
-    native_chord(&chord::parse(text)?).map(|_| ())
+    Shortcut::parse(text).map(|_| ())
+}
+
+enum Shortcut {
+    Chord { modifiers: u32, key: u32 },
+    Double(double_tap::Gesture),
+}
+
+impl Shortcut {
+    fn parse(text: &str) -> Result<Self, String> {
+        if let Some(gesture) = double_tap::Gesture::parse(text)? {
+            return Ok(Self::Double(gesture));
+        }
+        let (modifiers, key) = native_chord(&chord::parse(text)?)?;
+        Ok(Self::Chord { modifiers, key })
+    }
+}
+
+enum ShortcutListener {
+    Chord,
+    Double(raw_shortcut::RawShortcut),
+}
+
+impl ShortcutListener {
+    fn new(shortcut: Shortcut) -> Result<Self, String> {
+        match shortcut {
+            Shortcut::Double(gesture) => raw_shortcut::RawShortcut::new(gesture).map(Self::Double),
+            Shortcut::Chord { modifiers, key } => {
+                if unsafe { RegisterHotKey(null_mut(), HOTKEY_ID, modifiers | MOD_NOREPEAT, key) }
+                    == 0
+                {
+                    Err(format!(
+                        "cannot register quick terminal shortcut: {}",
+                        std::io::Error::last_os_error()
+                    ))
+                } else {
+                    Ok(Self::Chord)
+                }
+            }
+        }
+    }
+
+    fn handle(&mut self, message: &MSG, shortcut: &str) {
+        match self {
+            Self::Chord if message.message == WM_HOTKEY && message.wParam == HOTKEY_ID as usize => {
+                if !crate::quick_terminal::record_shortcut(shortcut) {
+                    request("quick_terminal.toggle");
+                }
+            }
+            Self::Double(input) => input.handle(message),
+            _ => {}
+        }
+    }
+}
+
+impl Drop for ShortcutListener {
+    fn drop(&mut self) {
+        if matches!(self, Self::Chord) {
+            unsafe { UnregisterHotKey(null_mut(), HOTKEY_ID) };
+        }
+    }
 }
 
 #[derive(Default)]
@@ -240,8 +304,7 @@ impl Hotkey {
         resize: Arc<Mutex<ResizeState>>,
         auto_hide: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let chord = chord::parse(&config.shortcut)?;
-        let (modifiers, key) = native_chord(&chord)?;
+        let binding = Shortcut::parse(&config.shortcut)?;
         let window = hwnd as usize;
         let shortcut = config.shortcut.clone();
         let (width, height) = (config.width, config.height);
@@ -252,13 +315,13 @@ impl Hotkey {
                 let mut message: MSG = std::mem::zeroed();
                 // A queue must exist before another thread can request shutdown.
                 PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
-                if RegisterHotKey(null_mut(), HOTKEY_ID, modifiers | MOD_NOREPEAT, key) == 0 {
-                    let _ = tx.send(Err(format!(
-                        "cannot register quick terminal shortcut: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                    return;
-                }
+                let mut listener = match ShortcutListener::new(binding) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        return;
+                    }
+                };
                 let hwnd = window as HWND;
                 FOCUS.with(|focus| {
                     *focus.borrow_mut() = Some(FocusState {
@@ -282,7 +345,6 @@ impl Hotkey {
                         "cannot observe quick terminal focus: {}",
                         std::io::Error::last_os_error()
                     )));
-                    UnregisterHotKey(null_mut(), HOTKEY_ID);
                     return;
                 }
                 let mut native = WindowOps {
@@ -311,11 +373,7 @@ impl Hotkey {
                             }
                             break;
                         }
-                        if message.message == WM_HOTKEY && message.wParam == HOTKEY_ID as usize {
-                            if !crate::quick_terminal::record_shortcut(&shortcut) {
-                                request("quick_terminal.toggle");
-                            }
-                        } else if matches!(message.message, SHOW | HIDE) {
+                        if matches!(message.message, SHOW | HIDE) {
                             if pending.load(Ordering::SeqCst) != message.wParam {
                                 continue;
                             }
@@ -334,13 +392,14 @@ impl Hotkey {
                             if let Err(error) = result {
                                 report_error(error);
                             }
+                        } else {
+                            listener.handle(&message, &shortcut);
                         }
                     }
                 }
                 if !hook.is_null() {
                     UnhookWinEvent(hook);
                 }
-                UnregisterHotKey(null_mut(), HOTKEY_ID);
             })
             .map_err(|e| format!("cannot start quick terminal shortcut listener: {e}"))?;
         match rx.recv() {

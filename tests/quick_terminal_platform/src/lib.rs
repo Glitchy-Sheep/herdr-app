@@ -71,6 +71,10 @@ pub mod quick_terminal {
     pub static RECORDING: AtomicBool = AtomicBool::new(false);
     pub static RECORDINGS: AtomicUsize = AtomicUsize::new(0);
     pub static RECORDED: Mutex<Option<String>> = Mutex::new(None);
+    #[cfg(windows)]
+    pub fn recording_active() -> bool {
+        RECORDING.load(Ordering::SeqCst)
+    }
     pub fn record_shortcut(shortcut: &str) -> bool {
         if !RECORDING.load(Ordering::SeqCst) {
             return false;
@@ -94,8 +98,13 @@ pub struct SavedSize {
 #[cfg(windows)]
 #[path = "../../../src/quick_terminal/windows.rs"]
 pub mod native;
+#[cfg(windows)]
+use native as windows;
 #[cfg(not(windows))]
 #[path = "../../../src/quick_terminal/linux.rs"]
 pub mod native;
 #[path = "../../../src/quick_terminal/release.rs"]
 pub mod release;
+#[cfg(windows)]
+#[path = "../../../src/quick_terminal/windows_recording.rs"]
+pub mod windows_recording;

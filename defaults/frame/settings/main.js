@@ -27,13 +27,16 @@ const APPEARANCES = [
 const DEFAULT_FONT = "JetBrains Mono";
 const DEFAULT_UI_FONT = "Geist";
 
-function shortcutKeys(value, mac) {
+function shortcutKeys(value, platform) {
   const text = String(value ?? "").trim().toLowerCase();
-  const names = { cmd: "Cmd", command: "Cmd", meta: "Cmd", super: mac ? "Cmd" : "Super", win: "Win", ctrl: "Ctrl", control: "Ctrl", alt: mac ? "Option" : "Alt", opt: "Option", option: "Option", shift: "Shift" };
+  const mac = platform === "macos";
+  const superKey = mac ? "Cmd" : platform === "windows" ? "Win" : "Super";
+  const altKey = mac ? "Option" : "Alt";
+  const names = { cmd: superKey, command: superKey, meta: superKey, super: superKey, win: superKey, ctrl: "Ctrl", control: "Ctrl", alt: altKey, opt: altKey, option: altKey, shift: "Shift" };
   const modifier = (name) => names[name] ?? name;
   const double = text.match(/^double-(?:(left|right)-)?(.+)$/);
   if (double) return [`${double[1] ? `${double[1] === "left" ? "Left" : "Right"} ` : ""}${modifier(double[2])}`, "×2"];
-  const side = text.match(/^(left|right)-(cmd|ctrl|alt|shift)$/);
+  const side = text.match(/^(left|right)-(cmd|ctrl|alt|shift|win|super)$/);
   if (side) return [`${side[1] === "left" ? "Left" : "Right"} ${modifier(side[2])}`];
   const symbols = { Cmd: "⌘", Ctrl: "⌃", Option: "⌥", Shift: "⇧" };
   const keys = { space: "Space", backquote: "`", grave: "`", backtick: "`", escape: "Esc", esc: "Esc", return: mac ? "Return" : "Enter", enter: mac ? "Return" : "Enter", tab: "Tab", backspace: mac ? "⌫" : "Backspace", left: "←", right: "→", up: "↑", down: "↓", minus: "-", equal: "=", bracketleft: "[", bracketright: "]", quote: "'", semicolon: ";", backslash: "\\", comma: ",", period: ".", slash: "/" };
@@ -743,25 +746,30 @@ export default class Settings extends View {
     });
   }
 
-  shortcutField(t, mac, current) {
+  shortcutField(t, platform, current) {
     const edit = this.shortcutEdit;
     const recording = edit?.state === "recording";
     const recorded = edit?.state === "recorded";
     const drainingError = edit?.state === "error" && edit.ready === false;
     const value = recorded ? edit.shortcut : recording ? edit.preview : current;
-    const labels = shortcutKeys(value, mac);
-    if (mac && typeof value === "string" && !recording && !/^double-/i.test(value.trim())) {
+    const labels = shortcutKeys(value, platform);
+    if (platform === "macos" && typeof value === "string" && !recording && !/^double-/i.test(value.trim())) {
       const cap = quickTerminalShortcut("validate", value)?.key_label;
       if (cap) labels[labels.length - 1] = /^[a-z]$/i.test(cap) ? cap.toUpperCase() : cap;
     }
-    const hint = drainingError ? "Release keys to continue" : recorded ? "Release keys to save" : recording && labels.length ? edit.phase === "modifier-down" ? "Release, then tap again" : "Press again for ×2" : mac ? "Press a shortcut or tap one modifier twice" : "Press a shortcut or a function key";
+    let hint = platform === "macos" || platform === "windows" ? "Press a shortcut or tap one modifier twice" : "Press a shortcut or a function key";
+    if (drainingError) hint = "Release keys to continue";
+    else if (recorded) hint = "Release keys to save";
+    else if (edit?.phase === "modifier-down") hint = "Release, then tap again";
+    else if (edit?.phase === "awaiting-second-tap") hint = "Press again for ×2";
     const active = recording || recorded || drainingError;
+    const spoken = labels[1] === "×2" ? `${labels[0]} twice` : labels.join(" + ");
     const trailing = this.shortcutSaving ? "Saving…" : active ? "Esc" : this.shortcutNotice ?? "Click to change";
     return v_flex().id("st-shortcut-editor").w_full().gap(8).py(12).border_b(1).border_color(t.border)
       .on_mouse_down_out((_e, cx) => this.leaveShortcut(cx))
       .child(div().text_size(14).text_color(t.foreground).child("Global shortcut"))
       .child(h_flex().id("st-shortcut-field").track_focus(this.shortcutHandle).tab_index(0).role("button")
-        .accessibility_label(active ? `${labels.join(" + ")}. ${hint}. Escape cancels.` : `Global shortcut: ${labels.join(" + ")}. Click to change.`)
+        .accessibility_label(active ? [spoken, hint, "Escape cancels."].filter(Boolean).join(". ") : `Global shortcut: ${spoken}. Click to change.`)
         .w_full().min_h(44).px(12).py(8).gap(10).items_center().rounded(7).border_1()
         .border_color(active ? t.accent : t.border).bg(t.background).cursor_pointer()
         .hover((s) => s.bg(t.raised))
@@ -856,8 +864,8 @@ export default class Settings extends View {
 
   quickTerminal(t) {
     const q = this.quickConfig();
-    const mac = window()?.platform === "macos";
-    const shortcut = q.shortcut ?? (mac ? "double-cmd" : "ctrl-alt-backquote");
+    const platform = window()?.platform;
+    const shortcut = q.shortcut ?? (platform === "macos" ? "double-cmd" : "ctrl-alt-backquote");
     const set = (key, value, cx, allowed) => this.change((p) => {
       p.quick_terminal = { ...(p.quick_terminal ?? {}), [key]: value };
     }, cx, allowed);
@@ -884,7 +892,7 @@ export default class Settings extends View {
         this.button(t, "st-quick-restart", restartLabel, (_e, cx) => this.restartHerdr(cx), Button)
           .bg(t.accent).border_color(t.accent).text_color(t.accent_foreground).hover((s) => s.bg(t.accent).opacity(0.9))
           .disabled(restartBlocked).when(restartBlocked, (el) => el.opacity(0.5)))))
-      .child(this.shortcutField(t, mac, shortcut))
+      .child(this.shortcutField(t, platform, shortcut))
       .child(this.row(t, "Hide when switching apps", "When off, Herdr stays above other windows.", this.toggle(t, "st-quick-blur", "Hide when switching apps", q.auto_hide ?? true, (enabled, cx) => set("auto_hide", enabled, cx))))
       .child(div().pt(12).child(this.heading(t, "Initial size")))
       .child(div().text_size(12.5).line_height("18px").text_color(t.dim).child("Percent of the usable screen. Changes reset the saved window size on restart."))
