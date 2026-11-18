@@ -352,6 +352,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         Ok(())
     };
+    let setup = conn.setup();
+    let mapping = conn
+        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
+        .reply()?;
+    let key = |sym| {
+        setup.min_keycode
+            + mapping
+                .keysyms
+                .chunks(mapping.keysyms_per_keycode as usize)
+                .position(|keys| keys.contains(&sym))
+                .unwrap() as u8
+    };
+    let ctrl = key(0xffe3);
+    let alt = key(0xffe9);
+    let grave = key(0x60);
+    let send_keys = |kind, keys: [u8; 3]| -> Result<(), Box<dyn std::error::Error>> {
+        for code in keys {
+            conn.xtest_fake_input(kind, code, 0, root, 0, 0, 0)?
+                .check()?;
+        }
+        conn.flush()?;
+        Ok(())
+    };
+    // The hotkey reply acknowledges earlier focus events on the same X11 listener.
+    let sync_focus = || -> Result<(), Box<dyn std::error::Error>> {
+        let before = TOGGLES.load(Ordering::SeqCst);
+        send_keys(KEY_PRESS_EVENT, [ctrl, alt, grave])?;
+        send_keys(KEY_RELEASE_EVENT, [grave, alt, ctrl])?;
+        wait("focus events processed before shortcut", &|| {
+            TOGGLES.load(Ordering::SeqCst) > before
+        });
+        Ok(())
+    };
     activate(xid)?;
     native.hide_on_blur()?;
     assert!(
@@ -368,14 +401,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[xid],
     )?
     .check()?;
+    activate(xid)?;
+    sync_focus()?;
+    let before = HIDES.load(Ordering::SeqCst);
+    activate(previous)?;
+    wait("blur before switching straight to dialog", &|| {
+        HIDES.load(Ordering::SeqCst) > before
+    });
     activate(dialog)?;
+    sync_focus()?;
     native.hide_on_blur()?;
     assert!(
         native.is_visible(),
         "a queued blur must keep the panel behind its active dialog"
     );
-    conn.destroy_window(dialog)?.check()?;
+    let before = HIDES.load(Ordering::SeqCst);
     activate(previous)?;
+    wait(
+        "leaving the active dialog requests auto-hide again",
+        &|| HIDES.load(Ordering::SeqCst) > before,
+    );
+    conn.destroy_window(dialog)?.check()?;
     native.hide_on_blur()?;
     wait("auto-hide with focus still outside Herdr", &|| {
         !native.is_visible()
@@ -442,26 +488,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait("focus after live auto-hide cycle", &|| {
         prop(root, "_NET_ACTIVE_WINDOW").first() == Some(&xid)
     });
-    let setup = conn.setup();
-    let mapping = conn
-        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)?
-        .reply()?;
-    let key = |sym| {
-        setup.min_keycode
-            + mapping
-                .keysyms
-                .chunks(mapping.keysyms_per_keycode as usize)
-                .position(|keys| keys.contains(&sym))
-                .unwrap() as u8
-    };
-    let ctrl = key(0xffe3);
-    let alt = key(0xffe9);
-    let grave = key(0x60);
-    for code in [ctrl, alt, grave] {
-        conn.xtest_fake_input(KEY_PRESS_EVENT, code, 0, root, 0, 0, 0)?
-            .check()?;
-    }
-    conn.flush()?;
+    TOGGLES.store(0, Ordering::SeqCst);
+    send_keys(KEY_PRESS_EVENT, [ctrl, alt, grave])?;
     wait("global shortcut", &|| TOGGLES.load(Ordering::SeqCst) == 1);
     std::thread::sleep(Duration::from_millis(1200));
     assert_eq!(
@@ -469,23 +497,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         1,
         "held shortcut must not repeat"
     );
-    for code in [grave, alt, ctrl] {
-        conn.xtest_fake_input(KEY_RELEASE_EVENT, code, 0, root, 0, 0, 0)?
-            .check()?;
-    }
-    conn.flush()?;
+    send_keys(KEY_RELEASE_EVENT, [grave, alt, ctrl])?;
     std::thread::sleep(Duration::from_millis(50));
-    for code in [ctrl, alt, grave] {
-        conn.xtest_fake_input(KEY_PRESS_EVENT, code, 0, root, 0, 0, 0)?
-            .check()?;
-    }
-    conn.flush()?;
+    send_keys(KEY_PRESS_EVENT, [ctrl, alt, grave])?;
     wait("second shortcut", &|| TOGGLES.load(Ordering::SeqCst) == 2);
-    for code in [grave, alt, ctrl] {
-        conn.xtest_fake_input(KEY_RELEASE_EVENT, code, 0, root, 0, 0, 0)?
-            .check()?;
-    }
-    conn.flush()?;
+    send_keys(KEY_RELEASE_EVENT, [grave, alt, ctrl])?;
     drop(native);
     let config = Config {
         auto_hide: false,
