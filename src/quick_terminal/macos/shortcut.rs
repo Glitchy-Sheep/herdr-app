@@ -2,6 +2,9 @@
 
 use std::collections::BTreeSet;
 
+#[path = "../tap_timing.rs"]
+mod timing;
+
 pub const MODIFIERS: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
 const FUNCTION: u64 = 1 << 23;
 
@@ -250,6 +253,11 @@ pub struct DoubleTap {
     held_keys: BTreeSet<u16>,
 }
 
+fn within_ms(start: f64, end: f64, limit: u32) -> bool {
+    std::time::Duration::try_from_secs_f64(end - start)
+        .is_ok_and(|elapsed| elapsed <= std::time::Duration::from_millis(u64::from(limit)))
+}
+
 impl DoubleTap {
     pub fn new(modifier: Modifier) -> Self {
         Self {
@@ -319,14 +327,13 @@ impl DoubleTap {
         let Some((pressed_key, pressed)) = self.pressed.take() else {
             return false;
         };
-        if key != pressed_key || at < pressed || at - pressed > 0.3 {
+        if key != pressed_key || !within_ms(pressed, at, timing::MAX_PRESS_MS) {
             self.released = None;
             return false;
         }
-        let double = self
-            .released
-            .take()
-            .is_some_and(|(last_key, last)| key == last_key && pressed >= last && at - last <= 0.4);
+        let double = self.released.take().is_some_and(|(last_key, last)| {
+            key == last_key && within_ms(last, pressed, timing::MAX_GAP_MS)
+        });
         if !double {
             self.released = Some((key, at));
         }
@@ -391,26 +398,20 @@ impl Capture {
             }
             CaptureResult::Error(_) if !self.drained() => "releasing",
             CaptureResult::Recording if self.held_modifiers != 0 => "modifier-down",
-            CaptureResult::Recording
-                if self
-                    .detector
-                    .as_ref()
-                    .is_some_and(|(_, detector)| detector.released.is_some()) =>
-            {
-                "awaiting-second-tap"
-            }
+            CaptureResult::Recording if self.preview.is_some() => "awaiting-second-tap",
             _ => "idle",
         }
     }
 
-    pub fn refresh(&mut self, at: f64) {
-        if let Some((_, detector)) = &mut self.detector
-            && detector.released.is_some_and(|(_, last)| at - last > 0.4)
+    pub fn refresh_preview(&mut self, at: f64) {
+        // A timely second press can still be in AppKit's queue when the preview expires.
+        if self.held_modifiers == 0
+            && let Some((_, detector)) = &self.detector
+            && detector
+                .released
+                .is_some_and(|(_, last)| !within_ms(last, at, timing::MAX_GAP_MS))
         {
-            detector.released = None;
-            if self.held_modifiers == 0 {
-                self.preview = None;
-            }
+            self.preview = None;
         }
     }
 
@@ -1007,13 +1008,48 @@ mod tests {
     }
 
     #[test]
+    fn modifier_pair_timing_matches_the_global_and_recorded_shortcut() {
+        super::timing::check_tap_pairs(|edges| {
+            let mut global = detector("double-left-alt");
+            let mut capture = Capture::default();
+            let mut fired = false;
+            for (index, ms) in edges.into_iter().enumerate() {
+                let flags = if index % 2 == 0 { 1 << 19 } else { 0 };
+                let at = f64::from(ms) / 1000.0;
+                fired = global.flags(58, flags, at);
+                capture.flags(58, flags, at);
+                if index < 3 {
+                    assert!(!fired);
+                }
+            }
+            assert_eq!(fired, capture.ready());
+            fired
+        });
+    }
+
+    #[test]
+    fn expired_preview_preserves_an_on_time_tap_waiting_in_the_queue() {
+        let mut capture = Capture::default();
+        capture.flags(58, 1 << 19, 0.0);
+        capture.flags(58, 0, 0.05);
+        capture.refresh_preview(0.8);
+        assert_eq!(capture.phase(), "idle");
+        capture.flags(58, 1 << 19, 0.35);
+        capture.flags(58, 0, 0.5);
+        assert_eq!(
+            capture.result,
+            CaptureResult::Recorded("double-left-alt".into())
+        );
+    }
+
+    #[test]
     fn awaiting_second_tap_preview_expires_and_a_long_hold_is_not_a_tap() {
         let mut capture = Capture::default();
         capture.flags(58, 1 << 19, 1.0);
         capture.flags(58, 0, 1.05);
         assert_eq!(capture.phase(), "awaiting-second-tap");
         assert_eq!(capture.preview.as_deref(), Some("left-alt"));
-        capture.refresh(1.5);
+        capture.refresh_preview(1.5);
         assert_eq!(capture.phase(), "idle");
         assert_eq!(capture.preview, None);
         capture.flags(58, 1 << 19, 2.0);
