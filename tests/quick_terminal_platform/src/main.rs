@@ -338,7 +338,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait("focus loss auto-hide request", &|| {
         HIDES.load(Ordering::SeqCst) > 0
     });
-    native.hide()?;
+    let activate = |id| -> Result<(), Box<dyn std::error::Error>> {
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            ClientMessageEvent::new(32, id, atom("_NET_ACTIVE_WINDOW"), [2, 0, 0, 0, 0]),
+        )?
+        .check()?;
+        conn.flush()?;
+        wait("window activated", &|| {
+            prop(root, "_NET_ACTIVE_WINDOW").first() == Some(&id)
+        });
+        Ok(())
+    };
+    activate(xid)?;
+    native.hide_on_blur()?;
+    assert!(
+        native.is_visible(),
+        "a queued blur must keep the refocused panel visible"
+    );
+
+    let dialog = create("Dialog owned by the quick terminal")?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        dialog,
+        AtomEnum::WM_TRANSIENT_FOR,
+        AtomEnum::WINDOW,
+        &[xid],
+    )?
+    .check()?;
+    activate(dialog)?;
+    native.hide_on_blur()?;
+    assert!(
+        native.is_visible(),
+        "a queued blur must keep the panel behind its active dialog"
+    );
+    conn.destroy_window(dialog)?.check()?;
+    activate(previous)?;
+    native.hide_on_blur()?;
+    wait("auto-hide with focus still outside Herdr", &|| {
+        !native.is_visible()
+    });
     native.show()?;
     wait("focus after auto-hide", &|| {
         prop(root, "_NET_ACTIVE_WINDOW").first() == Some(&xid)
@@ -392,7 +433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "live auto-hide enabled again without recreating backend",
         &|| HIDES.load(Ordering::SeqCst) > hides_before,
     );
-    native.hide()?;
+    native.hide_on_blur()?;
     wait(
         "re-enabled auto-hide hides after its request is dispatched",
         &|| !native.is_visible(),
@@ -496,7 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait("startup-disabled watcher supports enabling live", &|| {
         HIDES.load(Ordering::SeqCst) > hides_before
     });
-    native.hide()?;
+    native.hide_on_blur()?;
     wait(
         "startup-disabled backend hides after enabling live",
         &|| !native.is_visible(),

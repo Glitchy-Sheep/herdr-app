@@ -113,7 +113,7 @@ impl Recorder {
         unsafe {
             let process: id = msg_send![class!(NSProcessInfo), processInfo];
             let at: f64 = msg_send![process, systemUptime];
-            capture.refresh(at);
+            capture.refresh_preview(at);
         }
         snapshot(&capture)
     }

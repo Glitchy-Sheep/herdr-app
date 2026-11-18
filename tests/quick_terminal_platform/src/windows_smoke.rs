@@ -14,7 +14,10 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{
             MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey, VK_F24,
         },
-        Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_NOLEGACY},
+        Input::{
+            GetRegisteredRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_NOLEGACY,
+            RIDEV_REMOVE, RegisterRawInputDevices,
+        },
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, SendMessageW, WM_ENTERSIZEMOVE, WM_SIZING,
             WMSZ_BOTTOMRIGHT, WS_OVERLAPPEDWINDOW,
@@ -49,37 +52,73 @@ fn raw_inputs() -> std::io::Result<Vec<RAWINPUTDEVICE>> {
     Ok(inputs)
 }
 
+fn gesture_input(input: &RAWINPUTDEVICE) -> bool {
+    input.usUsagePage == 1 && matches!(input.usUsage, 2 | 6)
+}
+
 fn check_double_tap_listener(window: &Window, mut config: Config) -> Result<(), Box<dyn Error>> {
-    let keyboard = |input: &RAWINPUTDEVICE| input.usUsagePage == 1 && input.usUsage == 6;
-    assert!(!raw_inputs()?.iter().any(keyboard));
+    assert!(!raw_inputs()?.iter().any(gesture_input));
     config.shortcut = "double-left-alt".into();
     for _ in 0..2 {
         let native = Native::new(window, &config)?;
         assert!(!native.is_visible());
-        let inputs = raw_inputs()?;
-        let input = inputs
-            .iter()
-            .find(|input| keyboard(input))
-            .expect("global double Alt listener");
-        assert!(!input.hwndTarget.is_null());
-        assert_ne!(
-            input.dwFlags & RIDEV_INPUTSINK,
-            0,
-            "listens while Herdr is hidden"
+        let inputs: Vec<_> = raw_inputs()?.into_iter().filter(gesture_input).collect();
+        assert_eq!(
+            inputs.len(),
+            2,
+            "mouse and keyboard are registered before the first tap"
         );
         assert_eq!(
-            input.dwFlags & RIDEV_NOLEGACY,
-            0,
-            "ordinary shortcuts still reach applications"
+            inputs[0].hwndTarget, inputs[1].hwndTarget,
+            "one ordered message queue"
         );
+        for input in inputs {
+            assert!(!input.hwndTarget.is_null());
+            assert_ne!(
+                input.dwFlags & RIDEV_INPUTSINK,
+                0,
+                "listens while Herdr is hidden"
+            );
+            assert_eq!(
+                input.dwFlags & RIDEV_NOLEGACY,
+                0,
+                "ordinary input still reaches applications"
+            );
+        }
         drop(native);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while raw_inputs()?.iter().any(keyboard) {
+        while raw_inputs()?.iter().any(gesture_input) {
             if Instant::now() >= deadline {
                 return Err("double-tap listener remained registered after shutdown".into());
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+    let keyboard = RAWINPUTDEVICE {
+        usUsagePage: 1,
+        usUsage: 6,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: window.0.get() as HWND,
+    };
+    let size = size_of::<RAWINPUTDEVICE>() as u32;
+    if unsafe { RegisterRawInputDevices(&keyboard, 1, size) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    assert!(
+        Native::new(window, &config).is_err(),
+        "the existing keyboard owner keeps its registration"
+    );
+    let remaining: Vec<_> = raw_inputs()?.into_iter().filter(gesture_input).collect();
+    assert_eq!(remaining.len(), 1, "failed registration releases the mouse");
+    assert_eq!(remaining[0].usUsage, keyboard.usUsage);
+    assert_eq!(remaining[0].hwndTarget, keyboard.hwndTarget);
+    let remove = RAWINPUTDEVICE {
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: ptr::null_mut(),
+        ..keyboard
+    };
+    if unsafe { RegisterRawInputDevices(&remove, 1, size) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
 }
@@ -113,6 +152,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
     let native = Native::new(&window, &config)?;
     assert!(!native.is_visible());
+    assert!(
+        !raw_inputs()?.iter().any(gesture_input),
+        "a chord needs no raw keyboard or mouse subscription"
+    );
     let reserve = || unsafe {
         RegisterHotKey(
             ptr::null_mut(),

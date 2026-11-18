@@ -1,7 +1,7 @@
 //! Timing and physical identity of an isolated Windows modifier gesture.
 
-const MAX_PRESS_MS: u32 = 300;
-pub(super) const MAX_GAP_MS: u32 = 400;
+#[path = "../tap_timing.rs"]
+mod timing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -124,8 +124,12 @@ impl DoubleTap {
 
     pub(crate) fn refresh(&mut self, time: u32) {
         match self.0 {
-            State::Held { at, .. } if time.wrapping_sub(at) > MAX_PRESS_MS => self.interrupt(),
-            State::Waiting { at, .. } if time.wrapping_sub(at) > MAX_GAP_MS => self.0 = State::Idle,
+            State::Held { at, .. } if time.wrapping_sub(at) > timing::MAX_PRESS_MS => {
+                self.interrupt()
+            }
+            State::Waiting { at, .. } if time.wrapping_sub(at) > timing::MAX_GAP_MS => {
+                self.0 = State::Idle
+            }
             _ => {}
         }
     }
@@ -167,6 +171,17 @@ impl DoubleTap {
 #[cfg(test)]
 mod tests {
     use super::{DoubleTap, Gesture, ModifierKey::*, TapPhase};
+
+    #[test]
+    fn double_modifier_timing_matches_macos() {
+        super::timing::check_tap_pairs(|[down, up, next_down, next_up]| {
+            let mut detector = DoubleTap::default();
+            assert!(!detector.key(LeftAlt, true, down));
+            assert!(!detector.key(LeftAlt, false, up));
+            assert!(!detector.key(LeftAlt, true, next_down));
+            detector.key(LeftAlt, false, next_up)
+        });
+    }
 
     #[test]
     fn physical_side_release_and_wrapping_message_time() {

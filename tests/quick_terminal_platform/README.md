@@ -15,7 +15,7 @@ rustup target add x86_64-pc-windows-gnu
 cargo check --locked --tests --target x86_64-pc-windows-gnu --manifest-path tests/quick_terminal_platform/Cargo.toml
 ```
 
-On Windows, run the native smoke test with `cargo run --locked --manifest-path tests/quick_terminal_platform/Cargo.toml`. It creates a hidden HWND and verifies registration and cleanup of both Ctrl+Alt+Shift+F24 and the background keyboard listener for double Left Alt. It verifies that ordinary keyboard events stay enabled. On runners with a monitor, it sends resize messages to its own window. It leaves focus in the current application. Foreground restoration, physical shortcut presses, drag behavior and mixed-DPI positioning also need a desktop session.
+On Windows, run the native smoke test with `cargo run --locked --manifest-path tests/quick_terminal_platform/Cargo.toml`. It creates a hidden HWND and verifies registration and cleanup for Ctrl+Alt+Shift+F24 and double Left Alt. The double-tap listener registers the keyboard and mouse together, keeps ordinary input enabled and preserves an existing device registration if initialization fails. On runners with a monitor, the test sends resize messages to its own window. It leaves focus in the current application. Foreground restoration, physical shortcut presses, drag behavior and mixed-DPI positioning also need a desktop session.
 
 Run the X11 integration test with Docker.
 

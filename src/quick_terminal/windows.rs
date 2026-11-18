@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EVENT_SYSTEM_FOREGROUND, GWL_STYLE, GetCursorPos, GetForegroundWindow, GetMessageW,
+    EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, GWL_STYLE, GetAncestor, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindow,
     IsWindowVisible, IsZoomed, MINMAXINFO, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
     SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_SHOWWINDOW, SetForegroundWindow,
@@ -39,6 +39,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const HOTKEY_ID: i32 = 0x4844;
 const SHOW: u32 = WM_APP + 1;
 const HIDE: u32 = WM_APP + 2;
+const HIDE_ON_BLUR: u32 = WM_APP + 3;
 
 pub fn validate_shortcut(text: &str) -> Result<(), String> {
     Shortcut::parse(text).map(|_| ())
@@ -86,9 +87,10 @@ impl ShortcutListener {
     fn handle(&mut self, message: &MSG, shortcut: &str) {
         match self {
             Self::Chord if message.message == WM_HOTKEY && message.wParam == HOTKEY_ID as usize => {
-                if !crate::quick_terminal::record_shortcut(shortcut) {
-                    request("quick_terminal.toggle");
-                }
+                request_shortcut(
+                    super::windows_recording::message_time(message.time),
+                    Some(shortcut.into()),
+                );
             }
             Self::Double(input) => input.handle(message),
             _ => {}
@@ -141,9 +143,19 @@ thread_local! {
 
 struct FocusState {
     window: usize,
-    process: u32,
     was_active: bool,
     auto_hide: Arc<AtomicBool>,
+}
+
+fn focused_outside_herdr(panel: HWND, foreground: HWND) -> bool {
+    if foreground.is_null() || foreground == panel {
+        return false;
+    }
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(foreground, &mut pid);
+        pid != 0 && pid != GetCurrentProcessId() && GetAncestor(foreground, GA_ROOTOWNER) != panel
+    }
 }
 
 unsafe extern "system" fn foreground_changed(
@@ -159,13 +171,9 @@ unsafe extern "system" fn foreground_changed(
     FOCUS.with(|focus| {
         let mut focus = focus.borrow_mut();
         let Some(focus) = focus.as_mut() else { return };
-        let mut foreground_process = 0;
-        unsafe {
-            GetWindowThreadProcessId(hwnd, &mut foreground_process);
-        }
         if hwnd as usize == focus.window {
             focus.was_active = true;
-        } else if foreground_process != focus.process && focus.was_active {
+        } else if focus.was_active && focused_outside_herdr(focus.window as HWND, hwnd) {
             focus.was_active = false;
             if focus.auto_hide.load(Ordering::SeqCst) {
                 crate::mods::request(crate::mods::Request::QuickTerminalAutoHide);
@@ -174,11 +182,8 @@ unsafe extern "system" fn foreground_changed(
     });
 }
 
-fn request(name: &str) {
-    crate::mods::request(crate::mods::Request::Run {
-        name: name.into(),
-        args: serde_json::Value::Null,
-    });
+fn request_shortcut(posted: u64, chord: Option<String>) {
+    crate::mods::request(crate::mods::Request::WindowsQuickTerminalShortcut { posted, chord });
 }
 
 fn report_error(error: String) {
@@ -326,9 +331,8 @@ impl Hotkey {
                 FOCUS.with(|focus| {
                     *focus.borrow_mut() = Some(FocusState {
                         window,
-                        process: GetCurrentProcessId(),
                         was_active: GetForegroundWindow() == hwnd,
-                        auto_hide,
+                        auto_hide: auto_hide.clone(),
                     })
                 });
                 let hook = SetWinEventHook(
@@ -373,14 +377,14 @@ impl Hotkey {
                             }
                             break;
                         }
-                        if matches!(message.message, SHOW | HIDE) {
+                        if matches!(message.message, SHOW | HIDE | HIDE_ON_BLUR) {
                             if pending.load(Ordering::SeqCst) != message.wParam {
                                 continue;
                             }
-                            let result = if message.message == SHOW {
-                                native.show()
-                            } else {
-                                native.hide()
+                            let result = match message.message {
+                                SHOW => native.show(),
+                                HIDE_ON_BLUR if !auto_hide.load(Ordering::SeqCst) => continue,
+                                reason => native.hide(reason == HIDE_ON_BLUR),
                             };
                             let generation = message.wParam;
                             let _ = pending.compare_exchange(
@@ -530,6 +534,14 @@ impl Native {
         self.enqueue(HIDE, 2)
     }
 
+    pub fn hide_on_blur(&mut self) -> Result<(), String> {
+        let generation = self.pending.load(Ordering::SeqCst);
+        if generation & 3 == 0 {
+            self.post_action(HIDE_ON_BLUR, generation)?;
+        }
+        Ok(())
+    }
+
     pub fn is_visible(&self) -> bool {
         match self.pending.load(Ordering::SeqCst) & 3 {
             1 => true,
@@ -546,13 +558,20 @@ impl Native {
             })
             .unwrap();
         let generation = ((previous & !3).wrapping_add(4)) | action;
-        if unsafe { PostThreadMessageW(self.hotkey.thread_id, message, generation, 0) } == 0 {
+        if let Err(error) = self.post_action(message, generation) {
             let _ = self.pending.compare_exchange(
                 generation,
                 previous,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn post_action(&self, message: u32, generation: usize) -> Result<(), String> {
+        if unsafe { PostThreadMessageW(self.hotkey.thread_id, message, generation, 0) } == 0 {
             return Err(format!(
                 "cannot queue quick terminal window action: {}",
                 std::io::Error::last_os_error()
@@ -660,14 +679,17 @@ impl WindowOps {
         Ok(())
     }
 
-    fn hide(&mut self) -> Result<(), String> {
+    fn hide(&mut self, on_blur: bool) -> Result<(), String> {
         unsafe {
             if IsWindow(self.hwnd) == 0 {
                 return Err("quick terminal window is no longer available".into());
             }
-            let restore = GetForegroundWindow() == self.hwnd;
+            let foreground = GetForegroundWindow();
+            if on_blur && !focused_outside_herdr(self.hwnd, foreground) {
+                return Ok(());
+            }
             ShowWindow(self.hwnd, SW_HIDE);
-            if restore
+            if foreground == self.hwnd
                 && !self.previous.is_null()
                 && IsWindow(self.previous) != 0
                 && IsIconic(self.previous) == 0

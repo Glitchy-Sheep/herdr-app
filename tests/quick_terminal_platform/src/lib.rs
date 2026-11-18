@@ -36,11 +36,31 @@ pub mod mods {
             spec: serde_json::Value,
         },
         QuickTerminalAutoHide,
+        #[cfg(windows)]
+        WindowsQuickTerminalShortcut {
+            posted: u64,
+            chord: Option<String>,
+        },
         QuickTerminalShortcutError(Option<String>),
     }
     pub static TOGGLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     pub fn request(request: Request) {
         match request {
+            #[cfg(windows)]
+            Request::WindowsQuickTerminalShortcut { posted, chord } => {
+                use crate::windows_recording::{ShortcutTarget, shortcut_target};
+                match shortcut_target(posted) {
+                    ShortcutTarget::Terminal => {
+                        TOGGLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ShortcutTarget::Recorder => {
+                        if let Some(chord) = chord {
+                            crate::quick_terminal::capture_shortcut(&chord);
+                        }
+                    }
+                    ShortcutTarget::Ignore => {}
+                }
+            }
             Request::Run { name, .. } if name == "quick_terminal.toggle" => {
                 TOGGLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -71,16 +91,16 @@ pub mod quick_terminal {
     pub static RECORDING: AtomicBool = AtomicBool::new(false);
     pub static RECORDINGS: AtomicUsize = AtomicUsize::new(0);
     pub static RECORDED: Mutex<Option<String>> = Mutex::new(None);
-    #[cfg(windows)]
-    pub fn recording_active() -> bool {
-        RECORDING.load(Ordering::SeqCst)
+    pub(super) fn capture_shortcut(shortcut: &str) {
+        *RECORDED.lock().unwrap() = Some(shortcut.to_owned());
+        RECORDINGS.fetch_add(1, Ordering::SeqCst);
     }
+    #[cfg(not(windows))]
     pub fn record_shortcut(shortcut: &str) -> bool {
         if !RECORDING.load(Ordering::SeqCst) {
             return false;
         }
-        *RECORDED.lock().unwrap() = Some(shortcut.to_owned());
-        RECORDINGS.fetch_add(1, Ordering::SeqCst);
+        capture_shortcut(shortcut);
         true
     }
 }

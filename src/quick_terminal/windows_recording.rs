@@ -4,9 +4,9 @@ use super::windows::double_tap::{DoubleTap, ModifierKey, TapPhase};
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde_json::{Value, json};
-use std::{cell::RefCell, ptr::null_mut};
+use std::{cell::RefCell, ptr::null_mut, sync::Mutex};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::SystemInformation::GetTickCount;
+use windows_sys::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU,
@@ -20,6 +20,52 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 thread_local! {
     static FIELD: RefCell<Option<Field>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum RecordingPeriod {
+    #[default]
+    Never,
+    ActiveSince(u64),
+    FinishedAt(u64),
+}
+
+static PERIOD: Mutex<RecordingPeriod> = Mutex::new(RecordingPeriod::Never);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ShortcutTarget {
+    Terminal,
+    Recorder,
+    Ignore,
+}
+
+impl RecordingPeriod {
+    pub(super) fn current() -> Self {
+        *PERIOD.lock().unwrap()
+    }
+
+    pub(super) fn target(self, posted: u64) -> ShortcutTarget {
+        match self {
+            Self::Never => ShortcutTarget::Terminal,
+            Self::ActiveSince(start) if posted > start => ShortcutTarget::Recorder,
+            Self::FinishedAt(end) if posted > end => ShortcutTarget::Terminal,
+            // Events on the boundary share one Windows clock tick with the transition.
+            _ => ShortcutTarget::Ignore,
+        }
+    }
+}
+
+pub(crate) fn shortcut_target(posted: u64) -> ShortcutTarget {
+    RecordingPeriod::current().target(posted)
+}
+
+pub(super) fn message_time(time: u32) -> u64 {
+    expand_message_time(time, unsafe { GetTickCount64() })
+}
+
+// MSG.time contains the low 32 bits of uptime when the message was posted.
+fn expand_message_time(time: u32, now: u64) -> u64 {
+    now.saturating_sub(u64::from((now as u32).wrapping_sub(time)))
 }
 
 struct Field {
@@ -63,6 +109,7 @@ impl Recorder {
                 recorded: None,
             })
         });
+        *PERIOD.lock().unwrap() = RecordingPeriod::ActiveSince(unsafe { GetTickCount64() });
         Ok(Self(hook))
     }
 
@@ -78,6 +125,7 @@ impl Drop for Recorder {
     fn drop(&mut self) {
         FIELD.with_borrow_mut(|field| *field = None);
         unsafe { UnhookWindowsHookEx(self.0) };
+        *PERIOD.lock().unwrap() = RecordingPeriod::FinishedAt(unsafe { GetTickCount64() });
     }
 }
 
@@ -186,6 +234,23 @@ mod tests {
     use super::super::release::{Drain, released_status};
     use super::*;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
+
+    #[test]
+    fn queued_hotkeys_belong_to_the_recording_in_which_they_were_posted() {
+        let wrap = u64::from(u32::MAX) + 1;
+        let from_recorder = expand_message_time(u32::MAX - 1, wrap + 50);
+        assert_eq!(from_recorder, wrap - 2);
+        let active = RecordingPeriod::ActiveSince(wrap - 10);
+        assert_eq!(active.target(from_recorder), ShortcutTarget::Recorder);
+        let closed = RecordingPeriod::FinishedAt(wrap);
+        assert_eq!(closed.target(from_recorder), ShortcutTarget::Ignore);
+        assert_eq!(closed.target(wrap), ShortcutTarget::Ignore);
+        assert_eq!(closed.target(wrap + 1), ShortcutTarget::Terminal);
+        let reopened = RecordingPeriod::ActiveSince(wrap + 6);
+        assert_eq!(reopened.target(wrap + 1), ShortcutTarget::Ignore);
+        assert_eq!(reopened.target(wrap + 6), ShortcutTarget::Ignore);
+        assert_eq!(reopened.target(wrap + 7), ShortcutTarget::Recorder);
+    }
 
     #[test]
     fn queued_key_messages_preserve_the_modifier_side() {
