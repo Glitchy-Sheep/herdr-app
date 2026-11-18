@@ -14,6 +14,7 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{
             MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey, VK_F24,
         },
+        Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_NOLEGACY},
         WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, SendMessageW, WM_ENTERSIZEMOVE, WM_SIZING,
             WMSZ_BOTTOMRIGHT, WS_OVERLAPPEDWINDOW,
@@ -29,6 +30,58 @@ impl Drop for HiddenWindow {
             DestroyWindow(self.0);
         }
     }
+}
+
+fn raw_inputs() -> std::io::Result<Vec<RAWINPUTDEVICE>> {
+    let size = size_of::<RAWINPUTDEVICE>() as u32;
+    let mut count = 0;
+    if unsafe { GetRegisteredRawInputDevices(ptr::null_mut(), &mut count, size) } == u32::MAX {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut inputs = vec![RAWINPUTDEVICE::default(); count as usize];
+    if count != 0 {
+        let read = unsafe { GetRegisteredRawInputDevices(inputs.as_mut_ptr(), &mut count, size) };
+        if read == u32::MAX {
+            return Err(std::io::Error::last_os_error());
+        }
+        inputs.truncate(read as usize);
+    }
+    Ok(inputs)
+}
+
+fn check_double_tap_listener(window: &Window, mut config: Config) -> Result<(), Box<dyn Error>> {
+    let keyboard = |input: &RAWINPUTDEVICE| input.usUsagePage == 1 && input.usUsage == 6;
+    assert!(!raw_inputs()?.iter().any(keyboard));
+    config.shortcut = "double-left-alt".into();
+    for _ in 0..2 {
+        let native = Native::new(window, &config)?;
+        assert!(!native.is_visible());
+        let inputs = raw_inputs()?;
+        let input = inputs
+            .iter()
+            .find(|input| keyboard(input))
+            .expect("global double Alt listener");
+        assert!(!input.hwndTarget.is_null());
+        assert_ne!(
+            input.dwFlags & RIDEV_INPUTSINK,
+            0,
+            "listens while Herdr is hidden"
+        );
+        assert_eq!(
+            input.dwFlags & RIDEV_NOLEGACY,
+            0,
+            "ordinary shortcuts still reach applications"
+        );
+        drop(native);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while raw_inputs()?.iter().any(keyboard) {
+            if Instant::now() >= deadline {
+                return Err("double-tap listener remained registered after shutdown".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -112,8 +165,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     unsafe {
         UnregisterHotKey(ptr::null_mut(), 1);
     }
+    check_double_tap_listener(&window, config)?;
     println!(
-        "PASS: hidden Win32 window, native shortcut registration, cleanup and re-registration"
+        "PASS: hidden Win32 window, global chord and double Alt listeners, cleanup and re-registration"
     );
     Ok(())
 }

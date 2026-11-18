@@ -601,9 +601,13 @@ test("shortcut field displays the actual configured chord and sided double taps"
     v.person.quick_terminal.shortcut = shortcut;
     expect(text(find(v.render(cx), "st-shortcut-field"))).toContain(label);
   }
-  const portable = await view("windows");
-  expect(text(find(portable.render(cx), "st-shortcut-field"))).toContain("Ctrl Alt Space");
-  expect(text(find(portable.render(cx), "st-shortcut-editor"))).not.toContain("double-tap");
+  const windows = await view("windows", null);
+  expect(text(find(windows.render(cx), "st-shortcut-field"))).toContain("Ctrl Alt `");
+  windows.person.quick_terminal = { shortcut: "double-alt" };
+  expect(text(find(windows.render(cx), "st-shortcut-field"))).toContain("Alt ×2");
+  const linux = await view("linux");
+  click(linux, "st-shortcut-field");
+  expect(text(find(linux.render(cx), "st-shortcut-field"))).toContain("Press a shortcut or a function key");
 });
 
 test("released valid recording saves automatically once and preserves other settings", async () => {
@@ -632,13 +636,17 @@ test("released valid recording saves automatically once and preserves other sett
   expect(text(find(v.render(cx), "st-shortcut-field"))).toContain("Click to change");
 });
 
-for (const [modifier, name] of [["cmd", "Cmd"], ["ctrl", "Ctrl"], ["alt", "Option"], ["shift", "Shift"]]) {
+for (const [os, modifier, name] of [
+  ["macos", "cmd", "Cmd"], ["macos", "ctrl", "Ctrl"], ["macos", "alt", "Option"], ["macos", "shift", "Shift"],
+  ["windows", "super", "Win"], ["windows", "ctrl", "Ctrl"], ["windows", "alt", "Alt"], ["windows", "shift", "Shift"],
+]) {
   for (const side of ["left", "right"]) {
     const shortcut = `double-${side}-${modifier}`;
     const label = `${side === "left" ? "Left" : "Right"} ${name}`;
-    test(`${shortcut} previews its side and saves once after release`, async () => {
-      const v = await view();
+    test(`${os} ${shortcut} previews its side and saves once after release`, async () => {
+      const v = await view(os);
       click(v, "st-shortcut-field");
+      expect(text(find(v.render(cx), "st-shortcut-field"))).toContain("Press a shortcut or tap one modifier twice");
       capture = { state: "recording", preview: `${side}-${modifier}`, ready: false, phase: "modifier-down" };
       timers.get(100)!(cx);
       let field = text(find(v.render(cx), "st-shortcut-field"));
@@ -673,6 +681,7 @@ for (const [modifier, name] of [["cmd", "Cmd"], ["ctrl", "Ctrl"], ["alt", "Optio
       field = text(find(v.render(cx), "st-shortcut-field"));
       expect(field).toContain(`${label} ×2`);
       expect(field).toContain("Saved · restart required");
+      expect(find(v.render(cx), "st-shortcut-field")!.calls.accessibility_label[0]).toContain(`${label} twice`);
     });
   }
 }
@@ -680,12 +689,13 @@ for (const [modifier, name] of [["cmd", "Cmd"], ["ctrl", "Ctrl"], ["alt", "Optio
 for (const os of ["macos", "windows", "linux"]) {
   test(`${os} ordinary modifier chords use generic labels and save once after release`, async () => {
     const mac = os === "macos";
+    const superKey = os === "windows" ? "Win" : "Super";
     const cases = [
       ["ctrl-space", mac ? "⌃ Space" : "Ctrl Space"],
       ["alt-space", mac ? "⌥ Space" : "Alt Space"],
       ["shift-f8", mac ? "⇧ F8" : "Shift F8"],
-      ["super-space", mac ? "⌘ Space" : "Super Space"],
-      ["ctrl-alt-shift-super-space", mac ? "⌃ ⌥ ⇧ ⌘ Space" : "Ctrl Alt Shift Super Space"],
+      ["super-space", mac ? "⌘ Space" : `${superKey} Space`],
+      ["ctrl-alt-shift-super-space", mac ? "⌃ ⌥ ⇧ ⌘ Space" : `Ctrl Alt Shift ${superKey} Space`],
       ...(mac ? [["cmd-space", "⌘ Space"], ["ctrl-alt-shift-cmd-space", "⌃ ⌥ ⇧ ⌘ Space"]] : []),
     ];
     for (const [shortcut, label] of cases) {

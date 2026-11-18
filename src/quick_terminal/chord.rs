@@ -24,7 +24,7 @@ pub fn parse(text: &str) -> Result<Chord, String> {
     let text = text.trim().to_ascii_lowercase();
     let mut parts: Vec<_> = text.split(['-', '+']).map(str::trim).collect();
     if parts.first() == Some(&"double") {
-        return Err("quick_terminal.shortcut: double modifier shortcuts are supported only on macOS; choose ctrl-alt-backquote or a function key on this platform".into());
+        return Err("quick_terminal.shortcut: choose an ordinary chord such as ctrl-alt-backquote or a function key".into());
     }
     if parts.iter().any(|part| {
         matches!(
@@ -49,7 +49,10 @@ pub fn parse(text: &str) -> Result<Chord, String> {
                 | "rwin"
         )
     }) {
-        return Err("quick_terminal.shortcut: left/right modifiers are supported only on macOS for double taps; use ctrl, alt, shift or super without a side on this platform".into());
+        return Err(
+            "quick_terminal.shortcut: ordinary chords use ctrl, alt, shift or super without a side"
+                .into(),
+        );
     }
     let key = match parts.pop().unwrap_or("") {
         "backquote" | "grave" | "`" => Key::Backquote,
@@ -153,10 +156,7 @@ mod tests {
             "lshift-f8",
         ] {
             let error = parse(shortcut).unwrap_err();
-            assert!(
-                error.contains("supported only on macOS"),
-                "{shortcut}: {error}"
-            );
+            assert!(error.contains("ordinary chord"), "{shortcut}: {error}");
         }
     }
 }

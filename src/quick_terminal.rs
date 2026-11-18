@@ -10,6 +10,8 @@ use std::sync::{
 
 #[cfg(any(not(target_os = "macos"), test))]
 mod release;
+#[cfg(any(not(target_os = "macos"), test))]
+use release::released_status;
 
 static RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING: LazyLock<Mutex<(Option<u64>, Value)>> =
@@ -97,6 +99,11 @@ pub fn recording_status(owner: u64) -> Value {
     }
 }
 
+#[cfg(windows)]
+pub fn recording_active() -> bool {
+    RECORDING_ACTIVE.load(Ordering::SeqCst)
+}
+
 /// Reserved global keys reach the recorder through their native hotkey callback.
 #[cfg(not(target_os = "macos"))]
 pub fn record_shortcut(shortcut: &str) -> bool {
@@ -158,16 +165,6 @@ fn record_normalized_key(
             json!({ "state": "recording", "error": error, "ready": false, "phase": "idle" })
         }
     }
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn released_status(mut status: Value, drain: &release::Drain, modifiers_down: bool) -> Value {
-    if status["state"] == "recorded" {
-        let ready = drain.ready(modifiers_down);
-        status["ready"] = ready.into();
-        status["phase"] = if ready { "complete" } else { "releasing" }.into();
-    }
-    status
 }
 
 fn recording_complete(status: &Value) -> bool {
@@ -236,6 +233,8 @@ pub use macos::{keyboard_layout_changed, shortcut_key_label};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+mod windows_recording;
+#[cfg(windows)]
 use windows::{KeyNames, Native};
 #[cfg(target_os = "linux")]
 mod linux;
@@ -298,6 +297,8 @@ pub struct QuickTerminal {
     recorder: Option<macos::Recorder>,
     #[cfg(not(target_os = "macos"))]
     recorder: Option<gpui::Subscription>,
+    #[cfg(windows)]
+    modifier_recorder: Option<windows_recording::Recorder>,
     #[cfg(not(target_os = "macos"))]
     record_drain: std::rc::Rc<std::cell::RefCell<release::Drain>>,
     #[cfg(not(target_os = "macos"))]
@@ -574,6 +575,10 @@ impl QuickTerminal {
                 .ok_or("Focus the shortcut field before recording")?;
             let drain = std::rc::Rc::new(std::cell::RefCell::new(release::Drain::default()));
             let key_names = std::rc::Rc::new(KeyNames::new()?);
+            #[cfg(windows)]
+            {
+                self.modifier_recorder = Some(windows_recording::Recorder::start(window)?);
+            }
             self.record_drain = drain.clone();
             self.record_key_names = key_names.clone();
             self.recorder = Some(cx.intercept_keystrokes(move |event, window, cx| {
@@ -584,7 +589,9 @@ impl QuickTerminal {
                 let mut drain = drain.borrow_mut();
                 let key = &event.keystroke;
                 let name = key_names.normalize(&key.key);
-                drain.press(&name);
+                if !drain.press(&name) {
+                    return;
+                }
                 // GPUI folds Shift into symbols such as ! on a number key.
                 let shift = key.modifiers.shift || window.modifiers().shift;
                 let status = record_normalized_key(recording_status(owner), key, &name, shift);
@@ -659,6 +666,15 @@ impl QuickTerminal {
         if let Some(recorder) = &self.recorder {
             publish_recording(owner, recorder.status());
         }
+        if !window.is_window_active()
+            || self
+                .record_focus
+                .as_ref()
+                .is_some_and(|focus| !focus.is_focused(window))
+        {
+            self.stop_recording(recording_complete(&recording_status(owner)));
+            return;
+        }
         #[cfg(not(target_os = "macos"))]
         {
             match self.native.as_ref().map_or_else(
@@ -672,23 +688,21 @@ impl QuickTerminal {
                     return;
                 }
             }
+            let status = recording_status(owner);
+            #[cfg(windows)]
+            let status = if let Some(recorder) = &self.modifier_recorder {
+                recorder.status(status)
+            } else {
+                status
+            };
             publish_recording(
                 owner,
                 released_status(
-                    recording_status(owner),
+                    status,
                     &self.record_drain.borrow(),
                     window.modifiers().number_of_modifiers() != 0,
                 ),
             );
-        }
-        if !window.is_window_active()
-            || self
-                .record_focus
-                .as_ref()
-                .is_some_and(|focus| !focus.is_focused(window))
-        {
-            self.stop_recording(recording_complete(&recording_status(owner)));
-            return;
         }
         if recording_status(owner)["state"] == "cancelled" {
             self.cancel_recording();
@@ -719,6 +733,8 @@ impl QuickTerminal {
         }
         #[cfg(not(target_os = "macos"))]
         self.recorder.take();
+        #[cfg(windows)]
+        self.modifier_recorder.take();
         self.record_focus = None;
         RECORDING_ACTIVE.store(false, Ordering::SeqCst);
         if let Some(owner) = owner {

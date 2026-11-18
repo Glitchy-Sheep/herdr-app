@@ -1,6 +1,16 @@
 //! Key releases that must drain before a recorded shortcut can be saved.
 
+use serde_json::Value;
 use std::collections::BTreeSet;
+
+pub fn released_status(mut status: Value, drain: &Drain, modifiers_down: bool) -> Value {
+    if status["state"] == "recorded" {
+        let ready = drain.ready(modifiers_down);
+        status["ready"] = ready.into();
+        status["phase"] = if ready { "complete" } else { "releasing" }.into();
+    }
+    status
+}
 
 #[derive(Default)]
 pub struct Drain {
@@ -10,15 +20,18 @@ pub struct Drain {
 }
 
 impl Drain {
-    pub fn press(&mut self, key: &str) {
+    /// Returns whether the keystroke can supply the non-modifier part of a chord.
+    pub fn press(&mut self, key: &str) -> bool {
         let key = key.to_ascii_lowercase();
         // GPUI represents a standalone modifier release as a synthetic keystroke.
-        if !matches!(
+        if matches!(
             key.as_str(),
             "shift" | "ctrl" | "control" | "alt" | "platform" | "super" | "cmd" | "function"
         ) {
-            self.pressed.insert(key);
+            return false;
         }
+        self.pressed.insert(key);
+        true
     }
 
     pub fn release(&mut self, key: &str) {
@@ -56,7 +69,7 @@ mod tests {
     #[test]
     fn native_grabs_need_physical_release_and_modifiers_do_not_leave_phantom_keys() {
         let mut drain = Drain::default();
-        drain.press("control");
+        assert!(!drain.press("control"));
         assert!(drain.ready(false));
         drain.native_pending = true;
         drain.release("f8");
