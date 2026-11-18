@@ -1,0 +1,71 @@
+name: Quick Terminal Windows package
+
+on:
+  push:
+    branches: [test/quick-terminal-windows-package]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.repository == 'Glitchy-Sheep/herdr-app'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 9966d44f2c07e074a8b5c4193c89644f4cc7344f
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+      - name: Fetch the pinned Ghostty dependency through Git
+        working-directory: vendor/ghostty
+        run: |
+          scratch=$(mktemp -d)
+          git init -q "$scratch/repo"
+          git -C "$scratch/repo" fetch --depth=1 https://codeberg.org/vancluever/translate-c.git 4e879eb8aba615de112eabd1231ea6e01920cead
+          git -C "$scratch/repo" -c core.autocrlf=false archive --format=tar --prefix=translate-c/ --output="$scratch/translate-c.tar" FETCH_HEAD
+          zig fetch "$scratch/translate-c.tar"
+          test -d zig-pkg/translate_c-0.0.0-Q_BUWhVNBwDOEcIqub4VFPJPB6D9dgwzUMHTX5KWr8Xr
+      - name: Build and smoke-test the Windows binary
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: |
+          test "$(git rev-parse HEAD)" = 9966d44f2c07e074a8b5c4193c89644f4cc7344f
+          unset HERDR_APP_RELEASE
+          cargo build --release --locked --bin herdr-app
+          target/release/herdr-app.exe --version | tr -d '\r' | grep -x 'herdr-app 0.1.16'
+          target/release/herdr-app.exe commands > "$RUNNER_TEMP/herdr-commands.json"
+          for action in show hide toggle; do
+            grep -Fq "\"quick_terminal.$action\"" "$RUNNER_TEMP/herdr-commands.json"
+          done
+      - name: Pack the app and license notices
+        shell: pwsh
+        run: |
+          $stage = New-Item -ItemType Directory -Path package
+          Copy-Item -LiteralPath target/release/herdr-app.exe -Destination $stage
+          Copy-Item -LiteralPath assets/icons/herdr-ui-icon-clean.svg -Destination "$stage/herdr-app.svg"
+          Copy-Item -LiteralPath LICENSE, THIRD-PARTY-NOTICES -Destination $stage
+          New-Item -ItemType Directory -Path dist | Out-Null
+          $zip = 'dist/Herdr-Quick-Terminal-9966d44-windows-x64.zip'
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -CompressionLevel Optimal
+          $hashes = foreach ($path in @("$stage/herdr-app.exe", $zip)) {
+            '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant(), (Split-Path -Leaf $path)
+          }
+          $hashes | Set-Content -Encoding ascii -Path dist/SHA256SUMS.txt
+          $hashes
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: quick-terminal-windows-x64-9966d44
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
