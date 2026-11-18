@@ -88,10 +88,16 @@ jobs:
         run: |
           scratch=$(mktemp -d)
           git init -q "$scratch/repo"
-          git -C "$scratch/repo" fetch --depth=1 https://codeberg.org/vancluever/translate-c.git 4e879eb8aba615de112eabd1231ea6e01920cead
-          git -C "$scratch/repo" -c core.autocrlf=false archive --format=tar --prefix=translate-c/ --output="$scratch/translate-c.tar" FETCH_HEAD
+          revision=4e879eb8aba615de112eabd1231ea6e01920cead
+          if git -C "$scratch/repo" fetch --depth=1 https://codeberg.org/vancluever/translate-c.git "$revision"; then
+            archive="$scratch/translate-c.tar"
+            git -C "$scratch/repo" -c core.autocrlf=false archive --format=tar --prefix=translate-c/ --output="$archive" "$revision"
+          else
+            archive="$scratch/translate-c.tar.gz"
+            curl -fsSL --retry 3 "https://codeload.github.com/moderatelyConfused/translate-c/tar.gz/$revision" -o "$archive"
+          fi
           expected=translate_c-0.0.0-Q_BUWhVNBwDOEcIqub4VFPJPB6D9dgwzUMHTX5KWr8Xr
-          zig fetch "$scratch/translate-c.tar"
+          test "$(zig fetch "$archive" | tr -d '\r')" = "$expected"
           test -d "zig-pkg/$expected"
       - name: Keep unchanged sources fresh
         run: scripts/ci-sources restore
