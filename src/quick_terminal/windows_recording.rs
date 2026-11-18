@@ -32,8 +32,9 @@ pub struct Recorder(HHOOK);
 
 impl Recorder {
     pub fn start(window: &Window) -> Result<Self, String> {
-        let RawWindowHandle::Win32(handle) =
-            window.window_handle().map_err(|e| e.to_string())?.as_raw()
+        let RawWindowHandle::Win32(handle) = HasWindowHandle::window_handle(window)
+            .map_err(|e| e.to_string())?
+            .as_raw()
         else {
             return Err("Shortcut recording needs a Windows window".into());
         };
